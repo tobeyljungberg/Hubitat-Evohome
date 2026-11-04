@@ -1,0 +1,896 @@
+/**
+ * Evohome Connect for Hubitat
+ * Author: Tobey Ljungberg
+ * Version: 2.0.0
+ * Copyright (c) 2026 Tobey Ljungberg
+ * SPDX-License-Identifier: Apache-2.0
+ * Licensed under the Apache License, Version 2.0. You may use, modify and
+ * redistribute this work under those terms. See https://www.apache.org/licenses/LICENSE-2.0
+ * The EMEA TCC API used here is an undocumented vendor API.
+ */
+definition(name: "Evohome Connect", namespace: "tljungberg", author: "Tobey Ljungberg",
+    description: "Connect evohome heating, system modes and DHW to Hubitat.", category: "Convenience", singleInstance: true)
+
+preferences {
+    page(name: "mainPage", title: "Evohome Connect", install: true, uninstall: true) {
+        section("Evohome account and connection") {
+            paragraph "Connects Hubitat to your Evohome account. The app creates child devices for heating zones, the system controller and hot water when these are available."
+            input "username", "text", title: "Evohome account email or username",
+                description: "Enter the same account name you use to sign in to the Evohome app or website.", required: true
+            input "password", "password", title: "Evohome account password",
+                description: "Enter the password for this Evohome account.", required: true
+            input "apiHost", "text", title: "Evohome API host",
+                description: "Enter only the server origin, for example https://mytotalconnectcomfort.com. Do not add /WebApi, /api or another path.",
+                defaultValue: "https://mytotalconnectcomfort.com", required: true
+        }
+        section("Status updates and temperature changes") {
+            paragraph "Evohome commands do not confirm immediately that a change has taken effect. The app waits, then polls Evohome and updates the child devices with the reported state."
+            input "pollMinutes", "number", title: "Regular status check interval (minutes)",
+                description: "How often Hubitat asks Evohome for current temperatures, modes, faults and setpoints. A shorter interval gives fresher status and makes more API requests.",
+                range: "1..60", defaultValue: 5, required: true
+            input "debounceSeconds", "number", title: "Wait for temperature changes to settle (seconds)",
+                description: "After the last temperature adjustment, wait this long before sending it. Repeated HomeKit or Hubitat adjustments are combined into one final Evohome command.",
+                range: "1..15", defaultValue: 3, required: true
+            input "settleSeconds", "number", title: "Check Evohome after a command (seconds)",
+                description: "How long to wait before polling after a command, giving Evohome time to apply it. The child device updates immediately, then is corrected if Evohome reports a different value.",
+                range: "2..60", defaultValue: 8, required: true
+        }
+        section("Heating-only system compatibility") {
+            paragraph "Evohome zones control heating, not cooling or a fan. In HomeKit, export the heating-zone child devices only. Hubitat's native HomeKit integration may still show cooling and fan controls because it exports the complete Thermostat capability."
+            input "heatingOnly", "bool", title: "My Evohome system provides heating only",
+                description: "Turn on for a system without cooling. Zone devices keep the cooling target equal to the heating target and ignore cooling changes, so the two displayed temperatures stay aligned. This setting cannot hide controls that Hubitat's HomeKit integration adds.",
+                defaultValue: true
+        }
+        section("Synchronise Hubitat and Evohome modes") {
+            paragraph "These options apply when mode synchronisation is enabled. When Hubitat changes to Away, this app checks the current Evohome mode first. It does nothing if Evohome is already Off or Away. If it changes Evohome to Away, it can restore the previous mode when Hubitat leaves Away."
+            input "modeSyncEnabled", "bool", title: "Set Evohome to Away when Hubitat changes to Away",
+                description: "Enable automatic Away synchronisation. If Evohome is Off, it stays Off. If it is already Away, the app records that fact and does not claim to have changed it.",
+                defaultValue: false
+            input "restoreMode", "bool", title: "Restore the previous Evohome mode on return",
+                description: "When enabled, restore the mode saved before this app changed Evohome to Away. If Evohome was changed to Off while Hubitat was Away, it remains Off. When disabled, Evohome stays Away on return.",
+                defaultValue: true
+            input "preserveExistingAway", "bool",
+                title: "Keep Evohome Away on return if it was already Away when Hubitat left",
+                description: "Applies only when Evohome was already Away before Hubitat changed to Away. Leave on to keep Away on return; turn off to change Evohome to Auto on return. Heating Off is always preserved.",
+                defaultValue: true
+            input "awayDurationDays", "number", title: "How long Evohome stays in Away (days)",
+                description: "Use 0 for no expiry. A positive value gives the Away mode set by this app an expiry after that many days.",
+                range: "0..99", defaultValue: 0
+        }
+        section("Evohome fault notifications") {
+            paragraph "The app checks faults reported by Evohome and logs new faults. Select Hubitat mobile app notification devices to send a push when a new supported fault appears."
+            input "faultNotifyDevices", "capability.notification",
+                title: "Send new fault notifications to",
+                description: "Select one or more Hubitat mobile app notification devices. Existing faults found on the first successful check are reported too. Evohome does not provide boiler relay or OpenTherm status through this API.",
+                multiple: true, required: false
+        }
+        section("Logging") {
+            input "prefLogLevel", "enum", title: "Main app log level",
+                description: "Choose the detail recorded by the main app. Info gives readable activity messages; Debug adds API calls, responses and processing details. Child devices keep their own levels until you use Reset Logging.",
+                options: ["error", "warn", "info", "debug"], defaultValue: "info"
+            input "resetChildLogging", "button", title: "Reset Logging",
+                description: "Set the effective log level of every Evohome child device to the Main app log level selected above. Use this after changing child log levels individually."
+        }
+    }
+}
+
+def appButtonHandler(String buttonName) {
+    if (buttonName == "resetChildLogging") resetChildLogging()
+}
+
+private void resetChildLogging() {
+    String level = (settings.prefLogLevel ?: "info").toLowerCase()
+    List children = getChildDevices() ?: []
+    children.each { child ->
+        try {
+            child.setLogLevel(level)
+        } catch (Exception e) {
+            logMessage("warn", "Could not reset logging for " + child.displayName + ": " + e.message + ".")
+        }
+    }
+    logMessage("info", "Reset Logging set the log level of " + children.size() +
+        " Evohome child device(s) to " + level.capitalize() + ".")
+}
+
+def installed() { initialize() }
+def updated() { initialize() }
+def uninstalled() { unschedule(); unsubscribe(); getChildDevices()?.each { deleteChildDevice(it.deviceNetworkId) } }
+
+private void initialize() {
+    unschedule()
+    unsubscribe()
+    state.root = (settings.apiHost ?: "https://mytotalconnectcomfort.com").trim().replaceAll('/+$', '')
+    state.pending = state.pending ?: [:]
+    state.modeSnapshots = state.modeSnapshots ?: [:]
+    state.modeSyncOwned = state.modeSyncOwned ?: [:]
+    state.modeSyncPreExistingAway = state.modeSyncPreExistingAway ?: [:]
+    state.faultSnapshot = state.faultSnapshot ?: [:]
+    state.requestCounter = state.requestCounter ?: 0
+    Boolean heatingOnly = settings.heatingOnly != false
+    logMessage("debug", "Initialising; API host=" + state.root + ", poll=" + (settings.pollMinutes ?: 5) +
+        "m, debounce=" + (settings.debounceSeconds ?: 3) + "s, settle=" + (settings.settleSeconds ?: 8) +
+        "s, heatingOnly=" + heatingOnly + ".")
+    (getChildDevices() ?: []).findAll { it.deviceNetworkId?.startsWith("Evohome-Z-") }.each {
+        it.setHeatingOnly(heatingOnly)
+    }
+    subscribe(location, "mode", "locationModeChanged")
+    runIn(Math.max(1, (settings.pollMinutes ?: 5) as Integer) * 60, "poll", [overwrite: true])
+    runIn(5, "start")
+}
+
+private void logMessage(String level, String message) {
+    Map rank = [error: 1, warn: 2, info: 3, debug: 4]
+    String selected = (settings.prefLogLevel ?: "info").toLowerCase()
+    if ((rank[level] ?: 4) <= (rank[selected] ?: 3)) {
+        switch (level) {
+            case "error": log.error "Evohome Connect: " + message; break
+            case "warn": log.warn "Evohome Connect: " + message; break
+            case "info": log.info "Evohome Connect: " + message; break
+            default: log.debug "Evohome Connect: " + message
+        }
+    }
+}
+
+def start() {
+    if (state.token && state.tokenExpiry && now() < tokenRenewAt()) {
+        scheduleTokenRenewal()
+        logMessage("debug", "Start requested with a valid cached token; token renewal is scheduled. Refreshing the user account.")
+        apiGet("/WebAPI/emea/api/v1/userAccount", "account")
+    } else {
+        logMessage("debug", "Start requested; token missing, expired, or due for renewal. Beginning " +
+            (state.refreshToken ? "refresh-token" : "password") + " authentication.")
+        auth(state.refreshToken ? "refresh_token" : "password")
+    }
+}
+
+def poll() {
+    runIn(Math.max(1, (settings.pollMinutes ?: 5) as Integer) * 60, "poll", [overwrite: true])
+    logMessage("debug", "Poll started; tokenPresent=" + (state.token != null) + ", locations=" + (state.locations ?: []).size() + ".")
+    if (!state.token || !state.tokenExpiry || now() >= tokenRenewAt()) {
+        logMessage("debug", "Poll requires authentication or token renewal; renewalAt=" +
+            (state.tokenRenewAt ? new Date(state.tokenRenewAt as Long).toString() : "not scheduled") + ".")
+        start()
+        return
+    }
+    (state.locations ?: []).each { getLocation(it.toString(), "poll") }
+    if (!state.scheduleUpdatedAt || now() - (state.scheduleUpdatedAt as Long) > 3600000L) refreshSchedules()
+}
+
+void renewToken() {
+    if (!state.token || !state.tokenExpiry) {
+        logMessage("debug", "Scheduled token renewal fired without a usable access token; starting authentication.")
+        start()
+        return
+    }
+    Long renewAt = tokenRenewAt()
+    if (now() < renewAt) {
+        logMessage("debug", "Token renewal fired early; rescheduling for " + new Date(renewAt).toString() + ".")
+        scheduleTokenRenewal()
+        return
+    }
+    String grant = state.refreshToken ? "refresh_token" : "password"
+    logMessage("debug", "Scheduled token renewal starting; grant=" + grant + ", expiresAt=" +
+        new Date(state.tokenExpiry as Long).toString() + ".")
+    auth(grant)
+}
+
+private Long tokenRenewalLeadMs() {
+    Long lifetimeMs = ((state.tokenExpiresIn ?: 3600) as Long) * 1000L
+    Math.min(300000L, Math.max(30000L, (long)(lifetimeMs / 10L)))
+}
+
+private Long tokenRenewAt() {
+    if (state.tokenRenewAt) return state.tokenRenewAt as Long
+    if (!state.tokenExpiry) return now()
+    ((state.tokenExpiry as Long) - tokenRenewalLeadMs()) as Long
+}
+
+private void scheduleTokenRenewal() {
+    if (!state.token || !state.tokenExpiry) {
+        logMessage("debug", "Token renewal not scheduled because no access token expiry is available.")
+        return
+    }
+    Long renewAt = (state.tokenExpiry as Long) - tokenRenewalLeadMs()
+    state.tokenRenewAt = renewAt
+    Long delaySeconds = Math.max(1L, (long)Math.ceil((renewAt - now()) / 1000.0d))
+    runIn(delaySeconds as Integer, "renewToken", [overwrite: true])
+    logMessage("debug", "Token renewal scheduled for " + new Date(renewAt).toString() +
+        " (" + delaySeconds + "s from now, " + (tokenRenewalLeadMs() / 1000L) + "s before expiry).")
+}
+
+private void clearAccessToken(String reason) {
+    logMessage("debug", "Clearing cached access token; reason=" + reason + ".")
+    state.token = null
+    state.tokenExpiry = null
+    state.tokenRenewAt = null
+    unschedule("renewToken")
+}
+
+private void fallbackToPasswordAuth(String reason) {
+    logMessage("debug", "Refresh-token authentication failed; clearing cached refresh token and scheduling password authentication. reason=" + reason + ".")
+    clearAccessToken("refresh-token authentication failed")
+    state.refreshToken = null
+    runIn(2, "start", [overwrite: true])
+}
+
+private void auth(String grant) {
+    if (state.authInProgress && state.authStartedAt && now() - (state.authStartedAt as Long) < 120000L) {
+        logMessage("debug", "Authentication request skipped; grant=" + grant +
+            ", requestId=" + (state.authRequestId ?: "unknown") + " is already in progress.")
+        return
+    }
+    if (state.authInProgress) logMessage("warn", "Previous authentication request appears stalled; starting a new " + grant + " request.")
+    Map body = [grant_type: grant, scope: "EMEA-V1-Basic EMEA-V1-Anonymous EMEA-V1-Get-Current-User-Account EMEA-V1-Get-Location-Installation-Info-By-UserId"]
+    if (grant == "password") { body.Username = settings.username; body.Password = settings.password }
+    else body.refresh_token = state.refreshToken
+    // Hubitat's asynchronous HTTP methods serialise Map bodies as JSON.
+    // The evohome token endpoint expects application/x-www-form-urlencoded,
+    // so send an encoded string rather than the Map used by the old sync call.
+    String formBody = body.collect { key, value ->
+        java.net.URLEncoder.encode(key.toString(), "UTF-8") + "=" +
+            java.net.URLEncoder.encode(value == null ? "" : value.toString(), "UTF-8")
+    }.join("&")
+    String requestId = nextRequestId()
+    String authPath = "/WebApi/Auth/OAuth/Token"
+    state.authInProgress = true
+    state.authRequestId = requestId
+    state.authGrant = grant
+    state.authStartedAt = now()
+    logMessage("debug", "[" + requestId + "] POST " + state.root + authPath + "; grant=" + grant +
+        ", form-urlencoded body prepared; username, password, refresh token and API key are redacted.")
+    try {
+        asynchttpPost("apiResponse", [
+            uri: apiBase(), path: "/Auth/OAuth/Token",
+            headers: [Authorization: "Basic YjAxM2FhMjYtOTcyNC00ZGJkLTg4OTctMDQ4YjlhYWRhMjQ5OnRlc3Q=",
+                      Accept: "application/json, application/xml, text/json, text/x-json, text/javascript, text/xml",
+                      "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"],
+            body: formBody, timeout: 30, followRedirects: true
+        ], [action: "auth", grant: grant, requestId: requestId, method: "POST", path: authPath, requestAt: now()])
+    } catch (Exception e) {
+        state.authInProgress = false
+        state.authRequestId = null
+        logMessage("error", "[" + requestId + "] Could not queue " + grant + " authentication request.")
+        if (grant == "refresh_token") fallbackToPasswordAuth("refresh request could not be queued")
+        else clearAccessToken("password request could not be queued")
+    }
+}
+
+private String apiBase() {
+    state.root + "/WebApi"
+}
+
+private Map headers() {
+    [Authorization: "bearer " + state.token, applicationId: "b013aa26-9724-4dbd-8897-048b9aada249", Accept: "application/json"]
+}
+
+private String nextRequestId() {
+    state.requestCounter = ((state.requestCounter ?: 0) as Integer) + 1
+    "req-" + state.requestCounter
+}
+
+private String debugJson(def value, Integer maxLength = 1800) {
+    String text
+    try { text = groovy.json.JsonOutput.toJson(value) }
+    catch (Exception ignored) { text = String.valueOf(value) }
+    if (text.length() > maxLength) text = text.substring(0, maxLength) + "... [truncated; " + text.length() + " chars]"
+    text
+}
+
+private String responseSummary(String action, def payload) {
+    if (action == "auth") {
+        return "access_token=" + (payload?.access_token ? "present (redacted)" : "missing") +
+            ", refresh_token=" + (payload?.refresh_token ? "present (redacted)" : "missing") +
+            ", expires_in=" + (payload?.expires_in ?: "unknown")
+    }
+    if (action == "account") return "userId=" + (payload?.userId ?: "missing") + " (other account fields omitted)"
+    if (action == "installation" && payload instanceof List) {
+        return "locations=" + payload.size() + ", IDs=" +
+            payload.collect { it?.locationInfo?.locationId?.toString() }.findAll { it }.join(",")
+    }
+    debugJson(payload)
+}
+
+private void apiGet(String path, String action, Map meta = [:], Map query = [:]) {
+    Map params = [uri: apiBase(), path: path, headers: headers(), contentType: "application/json", timeout: 30]
+    if (query) params.query = query
+    String requestId = nextRequestId()
+    logMessage("debug", "[" + requestId + "] GET " + apiBase() + path + (query ? " query=" + debugJson(query, 500) : "") +
+        "; action=" + action + (meta ? ", context=" + debugJson(meta, 500) : ""))
+    asynchttpGet("apiResponse", params,
+        [action: action, requestId: requestId, method: "GET", path: path, requestAt: now()] + meta)
+}
+
+private void apiPut(String path, Map body, String action, Map meta = [:]) {
+    String requestId = nextRequestId()
+    logMessage("debug", "[" + requestId + "] PUT " + apiBase() + path + "; action=" + action +
+        ", body=" + debugJson(body, 1200) + (meta ? ", context=" + debugJson(meta, 500) : ""))
+    asynchttpPut("apiResponse", [uri: apiBase(), path: path, headers: headers(), contentType: "application/json", body: body, timeout: 30],
+        [action: action, requestId: requestId, method: "PUT", path: path, requestAt: now()] + meta)
+}
+
+void apiResponse(resp, Map meta) {
+    String action = meta?.action ?: "unknown"
+    String requestId = meta?.requestId ?: action
+    Map responseHeaders = resp?.getHeaders() instanceof Map ? resp.getHeaders() : [:]
+    def responseTypeEntry = responseHeaders.find { key, value -> key?.toString()?.equalsIgnoreCase("Content-Type") }
+    String responseType = responseTypeEntry?.value?.toString() ?: "unknown"
+    Long elapsed = meta?.requestAt ? now() - (meta.requestAt as Long) : null
+    logMessage("debug", "[" + requestId + "] response received; method=" + (meta?.method ?: "unknown") +
+        ", action=" + action + (meta?.grant ? ", grant=" + meta.grant : "") +
+        ", HTTP " + (resp?.status ?: "transport error") + ", Content-Type=" + responseType +
+        (elapsed != null ? ", elapsed=" + elapsed + "ms." : "."))
+    if (action == "auth") {
+        if (requestId != state.authRequestId) {
+            logMessage("debug", "[" + requestId + "] Ignoring stale authentication response; current requestId=" +
+                (state.authRequestId ?: "none") + ".")
+            return
+        }
+        state.authInProgress = false
+        state.authRequestId = null
+    }
+    if (resp?.hasError() || !(resp?.status >= 200 && resp?.status < 300)) {
+        def errorLocation = responseHeaders.find { key, value -> key?.toString()?.equalsIgnoreCase("Location") }
+        String failure = "[" + requestId + "] " + action + " failed; HTTP " + (resp?.status ?: "transport error")
+        if (errorLocation?.value) failure += ", redirect: " + errorLocation.value
+        logMessage("warn", failure)
+        if (action == "auth") {
+            if (meta?.grant == "refresh_token") fallbackToPasswordAuth("HTTP " + (resp?.status ?: "transport error"))
+            else clearAccessToken("password authentication failed with HTTP " + (resp?.status ?: "transport error"))
+            return
+        }
+        if (resp?.status == 401) {
+            clearAccessToken("API returned HTTP 401")
+            logMessage("debug", "Scheduling authentication after HTTP 401; refresh token will be tried first if available.")
+            runIn(2, "start", [overwrite: true])
+        }
+        if (action == "zoneBeforeWrite") {
+            state.pending?.remove(meta.zoneId?.toString())
+            getChildDevice(zdni(meta.zoneId?.toString()))?.refresh()
+        } else if (action in ["zoneWrite", "zoneClear", "systemWrite", "dhwWrite"]) {
+            runIn(5, "poll", [overwrite: true])
+        }
+        return
+    }
+    def json
+    try {
+        json = resp.json
+    } catch (Exception e) {
+        def locationEntry = responseHeaders.find { key, value -> key?.toString()?.equalsIgnoreCase("Location") }
+        String detail = "[" + requestId + "] " + action + " returned a non-JSON response; HTTP " + resp?.status +
+            ", Content-Type: " + responseType
+        if (locationEntry?.value) detail += ", redirect: " + locationEntry.value
+        logMessage("error", detail)
+        if (action == "auth" && meta?.grant == "refresh_token") {
+            fallbackToPasswordAuth("non-JSON authentication response")
+        } else if (action == "auth") {
+            clearAccessToken("password authentication returned non-JSON")
+        }
+        return
+    }
+    logMessage("debug", "[" + requestId + "] parsed " + action + " response: " + responseSummary(action, json))
+    Map obj = json instanceof Map ? json : [:]
+    switch (action) {
+        case "auth":
+            state.token = obj.access_token
+            if (obj.refresh_token) state.refreshToken = obj.refresh_token
+            if (obj.expires_in) state.tokenExpiresIn = obj.expires_in as Long
+            else state.tokenExpiresIn = 3600L
+            state.tokenExpiry = now() + (state.tokenExpiresIn as Long) * 1000L
+            state.tokenRenewAt = null
+            if (state.token) {
+                logMessage("debug", "[" + requestId + "] Authentication token received; expires_in=" +
+                    (obj.expires_in ?: "unknown") + "s; token values withheld. Requesting user account.")
+                scheduleTokenRenewal()
+                apiGet("/WebAPI/emea/api/v1/userAccount", "account")
+            } else {
+                logMessage("error", "[" + requestId + "] Auth response contained no access_token.")
+                if (meta?.grant == "refresh_token") fallbackToPasswordAuth("refresh response had no access token")
+                else clearAccessToken("password response had no access token")
+            }
+            break
+        case "account":
+            state.userId = obj.userId?.toString()
+            if (state.userId) {
+                logMessage("debug", "User account response received; userId=" + state.userId + ". Requesting installation configuration.")
+                apiGet("/WebAPI/emea/api/v1/location/installationInfo", "installation", [:],
+                    [userId: state.userId, includeTemperatureControlSystems: "True"])
+            } else {
+                logMessage("error", "[" + requestId + "] User account response contained no userId; installation request not sent.")
+            }
+            break
+        case "installation":
+            installChildren(json)
+            (state.locations ?: []).each { getLocation(it.toString(), "poll") }
+            refreshSchedules()
+            break
+        case "location":
+            acceptLocation(json, meta.locationId?.toString(), meta.reason?.toString(), meta)
+            break
+        case "zoneBeforeWrite":
+            writePendingZone(meta, obj)
+            break
+        case "zoneWrite":
+        case "zoneClear":
+        case "systemWrite":
+        case "dhwWrite":
+            logMessage("debug", "[" + requestId + "] Write response received for kind=" + meta.kind +
+                ", id=" + meta.id + "; scheduling state reconciliation in " + (settings.settleSeconds ?: 8) + "s.")
+            runIn(Math.max(2, (settings.settleSeconds ?: 8) as Integer), "refreshAfterWrite",
+                [data: [kind: meta.kind, id: meta.id], overwrite: true])
+            break
+        case "zoneStatus":
+            publishZone(obj, meta.zoneId.toString())
+            break
+        case "dhwStatus":
+            def dhwChild = getChildDevice(hdni(meta.id.toString()))
+            processFaults("dhw", meta.id.toString(), dhwChild?.displayName ?: "Hot water", obj.activeFaults)
+            dhwChild?.parseDhwStatus(obj)
+            break
+        case "schedule":
+            acceptSchedule(json, meta.zoneId.toString())
+            break
+    }
+}
+
+private void installChildren(def payload) {
+    List locs = payload instanceof List ? payload : []
+    logMessage("debug", "Installing/refreshing child devices from configuration: " + locs.size() + " location(s).")
+    state.installation = locs
+    state.locations = locs.collect { it.locationInfo?.locationId?.toString() }.findAll { it }
+    locs.each { loc ->
+        logMessage("debug", "Location configuration: locationId=" + loc.locationInfo?.locationId +
+            ", name=" + loc.locationInfo?.name + ", gatewayCount=" + (loc.gateways ?: []).size() + ".")
+        (loc.gateways ?: []).each { gw ->
+            (gw.temperatureControlSystems ?: []).each { sys ->
+                String sid = sys.systemId.toString()
+                logMessage("debug", "System configuration: systemId=" + sid +
+                    ", zoneCount=" + (sys.zones ?: []).size() + ", dhwId=" + sys.dhw?.dhwId + ".")
+                def controller = getChildDevice(sdni(sid)) ?: addChildDevice("tljungberg", "Evohome System Controller", sdni(sid), [label: (loc.locationInfo?.name ?: "Evohome") + " System"])
+                controller?.updateDataValue("systemId", sid)
+                controller?.updateDataValue("locationId", loc.locationInfo.locationId.toString())
+                (sys.zones ?: []).each { z ->
+                    String zid = z.zoneId.toString()
+                    def zone = getChildDevice(zdni(zid)) ?: addChildDevice("tljungberg", "Evohome Heating Zone", zdni(zid), [label: (z.name ?: "Zone") + " (evohome)"])
+                    zone?.updateDataValue("zoneId", zid)
+                    zone?.updateDataValue("systemId", sid)
+                    zone?.updateDataValue("locationId", loc.locationInfo.locationId.toString())
+                    zone?.updateDataValue("minSetpoint", (z.heatSetpointCapabilities?.minHeatSetpoint ?: 5).toString())
+                    zone?.updateDataValue("maxSetpoint", (z.heatSetpointCapabilities?.maxHeatSetpoint ?: 35).toString())
+                    zone?.setHeatingOnly(settings.heatingOnly != false)
+                }
+                if (sys.dhw?.dhwId) {
+                    String hid = sys.dhw.dhwId.toString()
+                    def hot = getChildDevice(hdni(hid)) ?: addChildDevice("tljungberg", "Evohome Hot Water", hdni(hid), [label: "Evohome Hot Water"])
+                    hot?.updateDataValue("dhwId", hid)
+                    hot?.updateDataValue("systemId", sid)
+                    hot?.updateDataValue("locationId", loc.locationInfo.locationId.toString())
+                }
+            }
+        }
+    }
+    logMessage("info", "Evohome installation configuration loaded. Found " + state.locations.size() + " location(s).")
+}
+
+private String zdni(String id) { "Evohome-Z-" + id }
+private String sdni(String id) { "Evohome-S-" + id }
+private String hdni(String id) { "Evohome-H-" + id }
+
+private void refreshSchedules() {
+    (state.installation ?: []).each { loc ->
+        (loc.gateways ?: []).each { gw ->
+            (gw.temperatureControlSystems ?: []).each { sys ->
+                (sys.zones ?: []).each { zone ->
+                    apiGet("/WebAPI/emea/api/v1/temperatureZone/" + zone.zoneId + "/schedule",
+                        "schedule", [zoneId: zone.zoneId.toString()])
+                }
+            }
+        }
+    }
+    state.scheduleUpdatedAt = now()
+}
+
+private void acceptSchedule(def schedule, String zoneId) {
+    Map scheduleData = schedule instanceof Map ? schedule as Map : [:]
+    if (scheduleData.schedule instanceof Map) scheduleData = scheduleData.schedule as Map
+    else if (scheduleData.data instanceof Map && scheduleData.data.dailySchedules) scheduleData = scheduleData.data as Map
+    List dailySchedules = scheduleData.dailySchedules instanceof List ? scheduleData.dailySchedules :
+        (schedule instanceof List ? schedule as List : [])
+    List entries = []
+    dailySchedules.each { day ->
+        (day.switchpoints ?: []).each { point ->
+            String dayName = (day.dayOfWeek ?: day.day ?: "").toString()
+            String time = (point.timeOfDay ?: point.time ?: "").toString()
+            def temp = point.heatSetpoint != null ? point.heatSetpoint :
+                (point.temperature != null ? point.temperature : point.setpoint)
+            if (dayName && time) entries << [day: dayName, time: time, temperature: temp]
+        }
+    }
+    if (!entries) {
+        logMessage("debug", "Schedule contained no usable switchpoints; zoneId=" + zoneId +
+            ", responseKeys=" + (scheduleData.keySet()?.join(",") ?: "none") +
+            ", dayCount=" + dailySchedules.size() + ".")
+        return
+    }
+    TimeZone tz = location.timeZone ?: TimeZone.getTimeZone("Europe/London")
+    Calendar nowCal = Calendar.getInstance(tz)
+    Calendar candidate = null
+    Map candidatePoint = null
+    Map dayNumbers = [sunday: Calendar.SUNDAY, monday: Calendar.MONDAY, tuesday: Calendar.TUESDAY,
+                      wednesday: Calendar.WEDNESDAY, thursday: Calendar.THURSDAY, friday: Calendar.FRIDAY, saturday: Calendar.SATURDAY]
+    entries.each { point ->
+        Integer targetDay = dayNumbers[point.day.toLowerCase()]
+        if (!targetDay) return
+        String[] parts = point.time.split(":")
+        if (parts.length < 2) return
+        Calendar c = Calendar.getInstance(tz)
+        c.set(Calendar.HOUR_OF_DAY, parts[0] as Integer)
+        c.set(Calendar.MINUTE, parts[1] as Integer)
+        c.set(Calendar.SECOND, 0)
+        c.set(Calendar.MILLISECOND, 0)
+        int addDays = (targetDay - c.get(Calendar.DAY_OF_WEEK) + 7) % 7
+        c.add(Calendar.DATE, addDays)
+        if (!c.after(nowCal)) c.add(Calendar.DATE, 7)
+        if (candidate == null || c.before(candidate)) {
+            candidate = c
+            candidatePoint = point
+        }
+    }
+    if (candidate) {
+        def child = getChildDevice(zdni(zoneId))
+        String nextTime = candidate.getTime().format("yyyy-MM-dd'T'HH:mm:ssXXX", tz)
+        child?.setNextScheduledTime(nextTime)
+        if (candidatePoint?.temperature != null) child?.setNextScheduledSetpoint(candidatePoint.temperature as BigDecimal)
+        logMessage("debug", "Next schedule point imported; zoneId=" + zoneId + ", time=" + nextTime +
+            ", setpoint=" + (candidatePoint?.temperature ?: "not supplied") + " C.")
+    }
+}
+
+private void getLocation(String id, String reason, Map extra = [:]) {
+    apiGet("/WebAPI/emea/api/v1/location/" + id + "/status", "location",
+        [locationId: id, reason: reason] + extra, [includeTemperatureControlSystems: "True"])
+}
+
+private void acceptLocation(def payload, String locationId, String reason, Map meta = [:]) {
+    if (!(payload instanceof Map)) return
+    logMessage("debug", "Processing location status; locationId=" + locationId + ", reason=" + reason +
+        ", gateways=" + (payload.gateways ?: []).size() + ".")
+    state.lastStatus = state.lastStatus ?: [:]
+    state.lastStatus[locationId] = payload
+    processFaults("location", locationId, payload.locationName ?: "Evohome location", payload.activeFaults)
+    (payload.gateways ?: []).each { gw ->
+        processFaults("gateway", gw.gatewayId?.toString(), "Evohome gateway", gw.activeFaults)
+        (gw.temperatureControlSystems ?: []).each { sys ->
+            String sid = sys.systemId.toString()
+            Map ms = sys.systemModeStatus ?: [:]
+            String mode = normalMode(ms.mode?.toString())
+            logMessage("debug", "Status for system " + sid + ": mode=" + mode +
+                ", zones=" + (sys.zones ?: []).size() + ", dhwPresent=" + (sys.dhw?.dhwId != null) + ".")
+            def controller = getChildDevice(sdni(sid))
+            processFaults("system", sid, controller?.displayName ?: "Evohome system", sys.activeFaults)
+            controller?.parseSystemStatus(mode, ms, sys.activeFaults)
+            (sys.zones ?: []).each { publishZone(it as Map, it.zoneId.toString(), mode) }
+            if (sys.dhw?.dhwId) {
+                String hid = sys.dhw.dhwId.toString()
+                def hot = getChildDevice(hdni(hid))
+                processFaults("dhw", hid, hot?.displayName ?: "Evohome hot water", sys.dhw.activeFaults)
+                hot?.parseDhwStatus(sys.dhw as Map)
+            }
+            if (reason == "zonePreflight" && (sys.zones ?: []).any { it.zoneId.toString() == meta.zoneId?.toString() }) {
+                preflightZoneWrite(meta.zoneId.toString(), mode)
+            }
+            if (reason == "syncEnter") syncEnter(sid, mode, ms)
+            if (reason == "syncLeave") syncLeave(sid, mode)
+        }
+    }
+}
+
+private void preflightZoneWrite(String zid, String mode) {
+    Map pending = (state.pending ?: [:])[zid]
+    if (!pending) return
+    if (mode == "off") {
+        state.pending.remove(zid)
+        getChildDevice(pending.dni)?.refresh()
+        logMessage("info", "Evohome is in Heating Off, so the requested change for zone " + zid + " was ignored.")
+        return
+    }
+    apiGet("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/status", "zoneBeforeWrite",
+        [zoneId: zid, version: pending.version])
+}
+
+private void publishZone(Map z, String zid, String systemMode = null) {
+    def child = getChildDevice(zdni(zid))
+    if (!child) return
+    Map sp = z.heatSetpointStatus ?: z.setpointStatus ?: [:]
+    Map ts = z.temperatureStatus ?: [:]
+    Map values = [temperature: ts.temperature, heatingSetpoint: sp.targetTemperature ?: sp.targetHeatTemperature,
+        setpointMode: sp.setpointMode, until: sp.until ?: sp.timeUntil, systemMode: systemMode ?: currentSystemMode(child.getDataValue("systemId")),
+        available: ts.isAvailable, activeFaults: z.activeFaults, nextScheduledTime: child.currentValue("nextScheduledTime")]
+    processFaults("zone", zid, child.displayName ?: ("Evohome zone " + zid), z.activeFaults)
+    if ((state.pending ?: [:])[zid]) {
+        values.heatingSetpoint = null
+        values.setpointMode = null
+        values.until = null
+    }
+    child.parseEvohomeStatus(values)
+}
+
+private void processFaults(String kind, String id, String label, def faults) {
+    if (!id || !(faults instanceof List)) return
+    String key = kind + ":" + id
+    List normalised = faults.collect { f ->
+        [faultType: f?.faultType?.toString() ?: "UnknownFault", since: f?.since?.toString()]
+    }
+    Map snapshots = state.faultSnapshot ?: [:]
+    List previous = snapshots[key] instanceof List ? snapshots[key] : []
+    Set previousKeys = previous.collect { it.faultType.toString() + "|" + (it.since ?: "") } as Set
+    List added = normalised.findAll { fault ->
+        String signature = fault.faultType.toString() + "|" + (fault.since ?: "")
+        !previousKeys.contains(signature)
+    }
+    snapshots[key] = normalised
+    state.faultSnapshot = snapshots
+    if (!added) return
+    added.each { fault ->
+        String text = readableFault(fault.faultType.toString())
+        String message = "evohome fault: " + label + ": " + text
+        if (fault.since) message += " (since " + fault.since + ")"
+        logMessage("warn", message)
+        (settings.faultNotifyDevices ?: []).each { notifier ->
+            try { notifier.deviceNotification(message) }
+            catch (Exception e) { logMessage("error", "Could not send fault notification to " + notifier.displayName + ": " + e.message) }
+        }
+    }
+}
+
+private String readableFault(String faultType) {
+    Map names = [
+        TempZoneActuatorLowBattery: "actuator low battery",
+        TempZoneSensorLowBattery: "sensor low battery",
+        TempZoneActuatorCommunicationLost: "actuator communication lost",
+        TempZoneSensorCommunicationLost: "sensor communication lost"
+    ]
+    names[faultType] ?: faultType.replaceAll(/([a-z])([A-Z])/, '$1 $2').toLowerCase()
+}
+
+private String currentSystemMode(String sid) {
+    def all = (state.lastStatus ?: [:]).values().find { x -> (x.gateways ?: []).any { g -> (g.temperatureControlSystems ?: []).any { it.systemId.toString() == sid } } }
+    def sys = all?.gateways?.collectMany { it.temperatureControlSystems ?: [] }?.find { it.systemId.toString() == sid }
+    normalMode(sys?.systemModeStatus?.mode?.toString())
+}
+
+private String normalMode(String raw) {
+    [Auto: "auto", AutoWithEco: "economy", Away: "away", DayOff: "dayOff", HeatingOff: "off", Custom: "custom", AutoWithReset: "auto"][raw] ?: (raw ?: "unknown").toLowerCase()
+}
+
+void refreshAfterWrite(Map d) {
+    logMessage("debug", "Post-write refresh requested; kind=" + d.kind + ", id=" + d.id + ".")
+    if (d.kind == "zone") {
+        apiGet("/WebAPI/emea/api/v1/temperatureZone/" + d.id + "/status", "zoneStatus", [zoneId: d.id])
+    } else {
+        String dni = d.kind == "system" ? sdni(d.id) : hdni(d.id)
+        def c = getChildDevice(dni)
+        String lid = c?.getDataValue("locationId")
+        if (lid) getLocation(lid, "poll")
+        if (d.kind == "dhw") apiGet("/WebAPI/emea/api/v1/domesticHotWater/" + d.id + "/status", "dhwStatus", [id: d.id])
+    }
+}
+
+void requestZoneSetpoint(String dni, BigDecimal value, String policy) {
+    def child = getChildDevice(dni)
+    String zid = child?.getDataValue("zoneId")
+    if (!zid) return
+    logMessage("info", "A target temperature of " + value + " °C was requested for " +
+        (child.displayName ?: "zone " + zid) + ". The request will be sent after the input settles.")
+    logMessage("debug", "Child request received: zone setpoint; zoneId=" + zid + ", requested=" + value +
+        " C, policy=" + (policy ?: "preserve") + ", debounce=" + (settings.debounceSeconds ?: 3) + "s.")
+    Map pending = state.pending ?: [:]
+    Map old = pending[zid] ?: [version: 0]
+    pending[zid] = [zoneId: zid, dni: dni, value: value, policy: policy ?: "preserve", action: "set", version: (old.version as Integer) + 1]
+    state.pending = pending
+    runIn(Math.max(1, (settings.debounceSeconds ?: 3) as Integer), "flushZone", [data: [zoneId: zid], overwrite: true])
+}
+
+void setZoneOff(String dni) { requestZoneSetpoint(dni, 5.0G, "permanent") }
+
+void clearZone(String dni) {
+    def c = getChildDevice(dni)
+    String zid = c?.getDataValue("zoneId")
+    if (!zid) return
+    logMessage("info", "The schedule was requested for " + (c.displayName ?: "zone " + zid) +
+        ". Clearing its override in Evohome.")
+    logMessage("debug", "Child request received: clear zone override; zoneId=" + zid + ".")
+    Map pending = state.pending ?: [:]
+    Map old = pending[zid] ?: [version: 0]
+    pending[zid] = [zoneId: zid, dni: dni, action: "clear", version: (old.version as Integer) + 1]
+    state.pending = pending
+    runIn(1, "flushZone", [data: [zoneId: zid], overwrite: true])
+}
+
+private void flushZone(Map d) {
+    Map p = (state.pending ?: [:])[d.zoneId.toString()]
+    if (!p) return
+    logMessage("debug", "Debounce elapsed; preparing zone command. zoneId=" + d.zoneId +
+        ", action=" + p.action + ", value=" + (p.value ?: "n/a") + ", policy=" + (p.policy ?: "n/a") +
+        ", version=" + p.version + ". Fetching fresh system and zone state before write.")
+    def c = getChildDevice(p.dni)
+    String locationId = c?.getDataValue("locationId")
+    if (!locationId) { logMessage("error", "No location ID for zone " + d.zoneId); return }
+    getLocation(locationId, "zonePreflight", [zoneId: d.zoneId.toString()])
+}
+
+private void writePendingZone(Map meta, Map fresh) {
+    String zid = meta.zoneId.toString()
+    Map p = (state.pending ?: [:])[zid]
+    if (!p) return
+    logMessage("debug", "Fresh zone state received before write; zoneId=" + zid +
+        ", currentSetpointMode=" + ((fresh.heatSetpointStatus ?: fresh.setpointStatus ?: [:]).setpointMode ?: "unknown") +
+        ", pendingAction=" + p.action + ", pendingValue=" + (p.value ?: "n/a") + ".")
+    if (meta.version != p.version) {
+        logMessage("debug", "Zone preflight is stale; zoneId=" + zid + ", responseVersion=" + meta.version +
+            ", currentVersion=" + p.version + ". Re-fetching latest requested value.")
+        runIn(1, "flushZone", [data: [zoneId: zid], overwrite: true])
+        return
+    }
+    if (p.action == "clear") {
+        String zoneLabel = getChildDevice(p.dni)?.displayName ?: ("zone " + zid)
+        logMessage("info", "The override for " + zoneLabel + " was cleared. Sending the zone back to its schedule in Evohome.")
+        logMessage("debug", "Sending FollowSchedule clear for zone " + zid + ".")
+        apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
+            [HeatSetpointValue: 0.0, SetpointMode: 0, TimeUntil: null], "zoneClear", [kind: "zone", id: zid])
+        state.pending.remove(zid)
+        return
+    }
+    Map sp = fresh.heatSetpointStatus ?: fresh.setpointStatus ?: [:]
+    String current = sp.setpointMode?.toString() ?: "FollowSchedule"
+    String policy = p.policy
+    Integer mode = 2
+    def until = null
+    if (policy == "permanent" || (policy == "preserve" && current == "PermanentOverride")) {
+        mode = 1
+    } else if (policy.startsWith("duration:")) {
+        mode = 2
+        Integer minutes = policy.substring("duration:".length()).isInteger() ? policy.substring("duration:".length()).toInteger() : 60
+        until = new Date(now() + Math.max(1, minutes) * 60000L).format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone("UTC"))
+    } else if (policy == "preserve" && current == "TemporaryOverride" && (sp.until || sp.timeUntil)) {
+        mode = 2
+        until = sp.until ?: sp.timeUntil
+    } else {
+        mode = policy == "permanent" ? 1 : 2
+        until = getChildDevice(zdni(zid))?.currentValue("nextScheduledTime")
+        if (!until && policy == "preserve" && (sp.until || sp.timeUntil)) until = sp.until ?: sp.timeUntil
+        if (!until && mode == 2) {
+            logMessage("warn", "No next switchpoint is known for zone " + zid + "; cancelled setpoint write.")
+            state.pending.remove(zid)
+            getChildDevice(p.dni)?.refresh()
+            return
+        }
+    }
+    apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
+        [HeatSetpointValue: p.value, SetpointMode: mode, TimeUntil: until], "zoneWrite", [kind: "zone", id: zid, version: p.version])
+    String zoneLabel = getChildDevice(p.dni)?.displayName ?: ("zone " + zid)
+    logMessage("info", "The target temperature for " + zoneLabel + " is being set to " + p.value +
+        " °C in Evohome with a " + (mode == 1 ? "permanent" : "temporary") + " override.")
+    logMessage("debug", "Zone write queued; zoneId=" + zid + ", setpoint=" + p.value + " C, mode=" + mode + ", until=" + (until ?: "permanent") + ".")
+    state.pending.remove(zid)
+}
+
+void setSystemMode(String sid, String mode, def until = null) {
+    logMessage("debug", "System mode command received from child; systemId=" + sid + ", mode=" + mode + ", until=" + (until ?: "permanent") + ".")
+    Map indices = [auto: 0, off: 1, economy: 2, away: 3, dayoff: 4, custom: 6]
+    String m = (mode ?: "").toLowerCase()
+    if (!indices.containsKey(m)) { logMessage("error", "Unsupported system mode: " + mode); return }
+    logMessage("info", "Setting the Evohome system mode to " + m.capitalize() +
+        (until ? " for the requested period." : " permanently."))
+    Boolean permanent = !until || until == 0 || until == "permanent"
+    def expiry = until
+    if (!permanent && until instanceof Number) expiry = new Date(now() + (until as Integer) * 86400000L)
+    if (expiry instanceof Date) expiry = expiry.format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone("UTC"))
+    if (permanent) expiry = null
+    apiPut("/WebAPI/emea/api/v1/temperatureControlSystem/" + sid + "/mode",
+        [SystemMode: indices[m], TimeUntil: expiry, Permanent: permanent], "systemWrite", [kind: "system", id: sid])
+}
+
+void setDhw(String id, String desired, def until = null) {
+    String v = (desired ?: "").toLowerCase()
+    logMessage("debug", "Hot-water command received from child; dhwId=" + id + ", requestedState=" + v +
+        ", duration=" + (until ?: "permanent") + ".")
+    if (v == "auto") {
+        logMessage("info", "Hot water was set to Auto. Clearing the override and returning it to its schedule in Evohome.")
+        logMessage("debug", "Mapping hot-water Auto to FollowSchedule clear; dhwId=" + id + ".")
+        apiPut("/WebAPI/emea/api/v1/domesticHotWater/" + id + "/state",
+            [Mode: "FollowSchedule", State: "", UntilTime: null], "dhwWrite", [kind: "dhw", id: id]); return
+    }
+    if (!(v in ["on", "off"])) return
+    logMessage("info", "Hot water was requested to turn " + v +
+        (until ? " for " + until + " minute(s)." : " permanently."))
+    Boolean permanent = !until || until == 0 || until == "permanent"
+    def expiry = until
+    if (!permanent && until instanceof Number) expiry = new Date(now() + (until as Integer) * 60000L)
+    if (expiry instanceof Date) expiry = expiry.format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone("UTC"))
+    logMessage("debug", "Mapping hot-water " + v + " to " + (permanent ? "permanent" : "temporary") +
+        " override; dhwId=" + id + ", until=" + (permanent ? "permanent" : expiry) + ".")
+    apiPut("/WebAPI/emea/api/v1/domesticHotWater/" + id + "/state",
+        [Mode: permanent ? "PermanentOverride" : "TemporaryOverride", State: v.capitalize(), UntilTime: permanent ? null : expiry],
+        "dhwWrite", [kind: "dhw", id: id])
+}
+
+void locationModeChanged(evt) {
+    logMessage("debug", "Hubitat location mode event received: " + evt?.value + ".")
+    if (!settings.modeSyncEnabled || !state.locations) return
+    String reason = evt.value?.toString()?.equalsIgnoreCase("Away") ? "syncEnter" : "syncLeave"
+    state.locations.each { getLocation(it.toString(), reason) }
+}
+
+private void syncEnter(String sid, String mode, Map snapshot) {
+    state.modeSyncPreExistingAway[sid] = false
+    if (mode == "off") {
+        logMessage("debug", "Mode sync skipped for system " + sid + ": evohome is HeatingOff; leaving it Off.")
+        return
+    }
+    if (mode == "away") {
+        state.modeSyncPreExistingAway[sid] = true
+        logMessage("debug", "Mode sync skipped for system " + sid + ": evohome is already Away; no previous mode was captured.")
+        return
+    }
+    if (mode == "unknown") {
+        logMessage("debug", "Mode sync skipped for system " + sid + ": current evohome mode is unknown.")
+        return
+    }
+    state.modeSnapshots[sid] = snapshot
+    state.modeSyncOwned[sid] = true
+    logMessage("info", "Hubitat changed to Away, setting Evohome to Away. I saved the current Evohome mode so it can be restored when Hubitat leaves Away.")
+    setSystemMode(sid, "away", (settings.awayDurationDays ?: 0) as Integer)
+}
+
+private void syncLeave(String sid, String mode) {
+    if (!state.modeSyncOwned[sid]) {
+        if (mode == "off") {
+            logMessage("debug", "Mode sync left system " + sid + " in HeatingOff on return home; preserving Off.")
+            state.modeSyncPreExistingAway.remove(sid)
+            return
+        }
+        if (state.modeSyncPreExistingAway[sid]) {
+            if (mode == "away" && settings.preserveExistingAway == false) {
+                logMessage("info", "Evohome was already Away when Hubitat left. The setting says to change Evohome to Auto when Hubitat returns, so I am doing that.")
+                setSystemMode(sid, "auto")
+            } else if (mode == "away") {
+                logMessage("debug", "Evohome was already Away before Hubitat left; preserving Away on return, as configured.")
+            } else {
+                logMessage("debug", "Evohome was already Away before Hubitat left, but is now " + mode + "; leaving that mode unchanged.")
+            }
+            state.modeSyncPreExistingAway.remove(sid)
+        }
+        return
+    }
+    if (mode != "away") {
+        if (mode == "off") logMessage("debug", "Mode sync left system " + sid + " in HeatingOff on return home; the mode had changed to Off while Away.")
+        else logMessage("debug", "Mode sync did not restore system " + sid + ": it is no longer in Away mode.")
+        state.modeSyncOwned[sid] = false
+        state.modeSnapshots.remove(sid)
+        state.modeSyncPreExistingAway.remove(sid)
+        return
+    }
+    if (!settings.restoreMode) {
+        logMessage("debug", "Mode sync restore is disabled; system " + sid + " remains in Away.")
+        state.modeSyncOwned[sid] = false
+        state.modeSnapshots.remove(sid)
+        state.modeSyncPreExistingAway.remove(sid)
+        return
+    }
+    Map snap = state.modeSnapshots[sid] ?: [:]
+    String restore = normalMode(snap.mode?.toString())
+    def end = snap.timeUntil ?: snap.until
+    Date expiry = end ? parseDate(end.toString()) : null
+    if (snap.isPermanent == false && expiry) {
+        if (expiry.after(new Date())) setSystemMode(sid, restore, expiry)
+        else setSystemMode(sid, "auto")
+    } else setSystemMode(sid, restore)
+    logMessage("info", "Hubitat left Away, so I am restoring the Evohome system to " + restore + ".")
+    state.modeSyncOwned[sid] = false
+    state.modeSnapshots.remove(sid)
+    state.modeSyncPreExistingAway.remove(sid)
+}
+
+private Date parseDate(String value) {
+    try { Date.parse("yyyy-MM-dd'T'HH:mm:ssXX", value) } catch (ignored) { null }
+}
