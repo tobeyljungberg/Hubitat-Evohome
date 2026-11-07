@@ -77,6 +77,7 @@ preferences {
                 description: "Set the effective log level of every Evohome child device to the Main app log level selected above. Use this after changing child log levels individually."
         }
     }
+    page(name: "windowContactPage", title: "Window contacts by zone", install: false, uninstall: false)
 }
 
 def windowContactPage() {
