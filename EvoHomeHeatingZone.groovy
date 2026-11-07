@@ -188,6 +188,15 @@ private String readableFault(String faultType) {
 void setHeatingSetpoint(BigDecimal requested) {
     logMessage("debug", "setHeatingSetpoint() received; requested=" + requested + " C, systemMode=" +
         device.currentValue("evohomeSystemMode") + ".")
+    Long coolingRequestAt = state.lastHomeKitCoolingRequestAt as Long
+    BigDecimal coolingRequest = state.lastHomeKitCoolingRequest as BigDecimal
+    if (heatingOnlyEnabled() && coolingRequestAt != null && coolingRequest != null &&
+        now() - coolingRequestAt <= 2000L && requested.compareTo(coolingRequest) != 0) {
+        logMessage("debug", "Ignoring paired heating target=" + requested +
+            " C because HomeKit just supplied cooling target=" + coolingRequest +
+            " C for the same heating-only thermostat update.")
+        return
+    }
     if (systemHeatingOff()) {
         logMessage("info", "Evohome is in Heating Off, so the requested temperature change for this zone was ignored.")
         refresh()
@@ -273,6 +282,12 @@ void cool() {
 void emergencyHeat() { setThermostatMode("heat") }
 void setCoolingSetpoint(BigDecimal value) {
     if (heatingOnlyEnabled()) {
+        // In HomeKit Auto mode, Hubitat can emit both callbacks for one
+        // target update. The cooling callback carries the requested target;
+        // the paired heating callback can carry the old target. Remember the
+        // cooling value briefly so it wins regardless of callback order.
+        state.lastHomeKitCoolingRequest = value
+        state.lastHomeKitCoolingRequestAt = now()
         logMessage("debug", "setCoolingSetpoint() received; requested=" + value +
             " C in heating-only mode. Treating the HomeKit cooling target as the requested heating target.")
         // Hubitat's native HomeKit integration can deliver its single
