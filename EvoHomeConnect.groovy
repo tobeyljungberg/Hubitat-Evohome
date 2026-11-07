@@ -80,7 +80,7 @@ preferences {
     page(name: "windowContactPage", title: "Window contacts by zone", install: false, uninstall: false)
 }
 
-def windowContactPage() {
+def windowContactPage(params) {
     List zones = windowContactZoneRows()
     dynamicPage(name: "windowContactPage", title: "Window contacts by zone", install: false, uninstall: false) {
         if (!zones) {
@@ -92,12 +92,11 @@ def windowContactPage() {
                 paragraph "Select any contact sensors assigned to each zone. If any selected sensor is open, that zone is held at a permanent 5 °C override. The original schedule or override is restored when all selected sensors close. While Evohome is in system-wide Heating Off, contact actions wait until the system leaves Off."
             }
             zones.each { zone ->
-                String settingName = "windowContacts_" + zone.zoneId
-                String title = zone.locationName + " / " + zone.zoneName + " window contacts"
-                section(title) {
-                    input name: settingName, type: "capability.contactSensor",
+                section(zone.locationName + " / " + zone.zoneName + " window contacts") {
+                    String settingName = "windowContacts_" + zone.zoneId
+                    input(name: settingName, type: "capability.contactSensor",
                         title: "Contact sensors", description: "Select one or more sensors for this zone.",
-                        multiple: true, required: false, showFilter: true
+                        multiple: true, required: false, showFilter: true)
                 }
             }
         }
