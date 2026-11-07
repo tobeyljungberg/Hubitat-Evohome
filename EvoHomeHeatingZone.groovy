@@ -273,10 +273,15 @@ void cool() {
 void emergencyHeat() { setThermostatMode("heat") }
 void setCoolingSetpoint(BigDecimal value) {
     if (heatingOnlyEnabled()) {
-        def heat = device.currentValue("heatingSetpoint")
         logMessage("debug", "setCoolingSetpoint() received; requested=" + value +
-            " C, ignored in heating-only mode; restoring coolingSetpoint to heatingSetpoint=" + heat + " C.")
-        if (heat != null) sendEvent(name: "coolingSetpoint", value: heat, unit: "°C")
+            " C in heating-only mode. Treating the HomeKit cooling target as the requested heating target.")
+        // Hubitat's native HomeKit integration can deliver its single
+        // temperature target through setCoolingSetpoint(), even when the
+        // thermostat is in Heat mode. Route it through the same clamp,
+        // optimistic update and debounced Evohome write as a heating target.
+        // A preceding stale setHeatingSetpoint event is coalesced by the
+        // parent's debounce, so the final HomeKit value wins.
+        setHeatingSetpoint(value)
         return
     }
     logMessage("debug", "setCoolingSetpoint() received; requested=" + value + "; evohome cooling is unsupported.")
