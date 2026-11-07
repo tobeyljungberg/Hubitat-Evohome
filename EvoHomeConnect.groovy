@@ -46,6 +46,11 @@ preferences {
             href name: "windowContactSetup", page: "windowContactPage", title: "Configure window contacts by zone",
                 description: "Open the zone mapping page. Any open selected contact holds that zone at 5 °C."
         }
+        section("Away mode zone override preservation") {
+            paragraph "Choose separately for each zone whether Evohome overrides should be restored after the integration changes the system to Away and then restores its previous mode."
+            href name: "awayOverrideSetup", page: "awayOverridePage", title: "Configure Away override preservation by zone",
+                description: "Choose which zones should restore saved permanent or unexpired temporary overrides after Away."
+        }
         section("Synchronise Hubitat and Evohome modes") {
             paragraph "These options apply when mode synchronisation is enabled. When Hubitat changes to Away, this app checks the current Evohome mode first. It does nothing if Evohome is already Off or Away. If it changes Evohome to Away, it can restore the previous mode when Hubitat leaves Away."
             input "modeSyncEnabled", "bool", title: "Set Evohome to Away when Hubitat changes to Away",
@@ -78,6 +83,7 @@ preferences {
         }
     }
     page(name: "windowContactPage", title: "Window contacts by zone", install: false, uninstall: false)
+    page(name: "awayOverridePage", title: "Away override preservation by zone", install: false, uninstall: false)
 }
 
 def windowContactPage(params) {
@@ -97,6 +103,29 @@ def windowContactPage(params) {
                     input(name: settingName, type: "capability.contactSensor",
                         title: "Contact sensors", description: "Select one or more sensors for this zone.",
                         multiple: true, required: false, showFilter: true)
+                }
+            }
+        }
+    }
+}
+
+def awayOverridePage(params) {
+    List zones = windowContactZoneRows()
+    dynamicPage(name: "awayOverridePage", title: "Away override preservation by zone", install: false, uninstall: false) {
+        if (!zones) {
+            section("Zones not available yet") {
+                paragraph "Evohome zone details are loaded during the first installation sync. Save and install the app, wait for its first successful sync and for zone child devices to appear, then reopen this page."
+            }
+        } else {
+            section("Choose which zone overrides to restore") {
+                paragraph "When Hubitat changes to Away and the integration changes Evohome to Away, Evohome may clear room overrides. Enable this for each zone whose override should be saved and restored when the previous system mode returns. Permanent overrides are restored permanently. Temporary overrides are restored only while their original expiry is still in the future; otherwise the zone returns to its schedule."
+            }
+            zones.each { zone ->
+                section(zone.locationName + " / " + zone.zoneName) {
+                    input(name: "preserveAwayOverride_" + zone.zoneId, type: "bool",
+                        title: "Preserve this zone's override when Away is enabled",
+                        description: "Save and restore this zone's current permanent or unexpired temporary override.",
+                        defaultValue: false)
                 }
             }
         }
@@ -227,6 +256,7 @@ private void initialize() {
     state.root = (settings.apiHost ?: "https://mytotalconnectcomfort.com").trim().replaceAll('/+$', '')
     state.pending = state.pending ?: [:]
     state.modeSnapshots = state.modeSnapshots ?: [:]
+    state.awayZoneSnapshots = state.awayZoneSnapshots ?: [:]
     state.modeSyncOwned = state.modeSyncOwned ?: [:]
     state.modeSyncPreExistingAway = state.modeSyncPreExistingAway ?: [:]
     state.faultSnapshot = state.faultSnapshot ?: [:]
@@ -550,7 +580,7 @@ void apiResponse(resp, Map meta) {
             logMessage("debug", "[" + requestId + "] Write response received for kind=" + meta.kind +
                 ", id=" + meta.id + "; scheduling state reconciliation in " + (settings.settleSeconds ?: 8) + "s.")
             runIn(Math.max(2, (settings.settleSeconds ?: 8) as Integer), "refreshAfterWrite",
-                [data: [kind: meta.kind, id: meta.id], overwrite: true])
+                [data: [kind: meta.kind, id: meta.id, restoreZoneOverrides: meta.restoreZoneOverrides == true], overwrite: true])
             break
         case "zoneStatus":
             publishZone(obj, meta.zoneId.toString())
@@ -716,8 +746,9 @@ private void acceptLocation(def payload, String locationId, String reason, Map m
             if (reason == "zonePreflight" && (sys.zones ?: []).any { it.zoneId.toString() == meta.zoneId?.toString() }) {
                 preflightZoneWrite(meta.zoneId.toString(), mode)
             }
-            if (reason == "syncEnter") syncEnter(sid, mode, ms)
+            if (reason == "syncEnter") syncEnter(sid, mode, ms, sys)
             if (reason == "syncLeave") syncLeave(sid, mode)
+            if (reason == "syncRestore" && meta.systemId?.toString() == sid) restoreAwayZoneOverrides(sid, sys, mode)
         }
     }
 }
@@ -817,7 +848,8 @@ void refreshAfterWrite(Map d) {
         String dni = d.kind == "system" ? sdni(d.id) : hdni(d.id)
         def c = getChildDevice(dni)
         String lid = c?.getDataValue("locationId")
-        if (lid) getLocation(lid, "poll")
+        if (lid) getLocation(lid, d.restoreZoneOverrides == true ? "syncRestore" : "poll",
+            d.restoreZoneOverrides == true ? [systemId: d.id.toString()] : [:])
         if (d.kind == "dhw") apiGet("/WebAPI/emea/api/v1/domesticHotWater/" + d.id + "/status", "dhwStatus", [id: d.id])
     }
 }
@@ -1105,7 +1137,7 @@ private void writePendingZone(Map meta, Map fresh) {
     state.pending.remove(zid)
 }
 
-void setSystemMode(String sid, String mode, def until = null) {
+void setSystemMode(String sid, String mode, def until = null, Boolean restoreZoneOverrides = false) {
     logMessage("debug", "System mode command received from child; systemId=" + sid + ", mode=" + mode + ", until=" + (until ?: "permanent") + ".")
     Map indices = [auto: 0, off: 1, economy: 2, away: 3, dayoff: 4, custom: 6]
     String m = (mode ?: "").toLowerCase()
@@ -1118,7 +1150,8 @@ void setSystemMode(String sid, String mode, def until = null) {
     if (expiry instanceof Date) expiry = expiry.format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone("UTC"))
     if (permanent) expiry = null
     apiPut("/WebAPI/emea/api/v1/temperatureControlSystem/" + sid + "/mode",
-        [SystemMode: indices[m], TimeUntil: expiry, Permanent: permanent], "systemWrite", [kind: "system", id: sid])
+        [SystemMode: indices[m], TimeUntil: expiry, Permanent: permanent], "systemWrite",
+        [kind: "system", id: sid, restoreZoneOverrides: restoreZoneOverrides])
 }
 
 void setDhw(String id, String desired, def until = null) {
@@ -1152,7 +1185,7 @@ void locationModeChanged(evt) {
     state.locations.each { getLocation(it.toString(), reason) }
 }
 
-private void syncEnter(String sid, String mode, Map snapshot) {
+private void syncEnter(String sid, String mode, Map snapshot, Map systemStatus) {
     state.modeSyncPreExistingAway[sid] = false
     if (mode == "off") {
         logMessage("debug", "Mode sync skipped for system " + sid + ": evohome is HeatingOff; leaving it Off.")
@@ -1167,6 +1200,19 @@ private void syncEnter(String sid, String mode, Map snapshot) {
         logMessage("debug", "Mode sync skipped for system " + sid + ": current evohome mode is unknown.")
         return
     }
+    Map savedZones = [:]
+    (systemStatus?.zones ?: []).each { zone ->
+        String zid = zone.zoneId?.toString()
+        if (!zid || settings["preserveAwayOverride_" + zid] != true) return
+        Map setpoint = zone.heatSetpointStatus ?: zone.setpointStatus ?: [:]
+        String zoneMode = setpoint.setpointMode?.toString()
+        if (!(zoneMode in ["TemporaryOverride", "PermanentOverride"])) return
+        savedZones[zid] = [mode: zoneMode, target: setpoint.targetTemperature ?: setpoint.targetHeatTemperature,
+            until: setpoint.until ?: setpoint.timeUntil]
+        logMessage("debug", "Saved the " + zoneMode + " for zone " + zid + " before Away; target=" +
+            (savedZones[zid].target ?: "not reported") + " C, until=" + (savedZones[zid].until ?: "none") + ".")
+    }
+    state.awayZoneSnapshots[sid] = savedZones
     state.modeSnapshots[sid] = snapshot
     state.modeSyncOwned[sid] = true
     logMessage("info", "Hubitat changed to Away, setting Evohome to Away. I saved the current Evohome mode so it can be restored when Hubitat leaves Away.")
@@ -1198,6 +1244,7 @@ private void syncLeave(String sid, String mode) {
         else logMessage("debug", "Mode sync did not restore system " + sid + ": it is no longer in Away mode.")
         state.modeSyncOwned[sid] = false
         state.modeSnapshots.remove(sid)
+        state.awayZoneSnapshots.remove(sid)
         state.modeSyncPreExistingAway.remove(sid)
         return
     }
@@ -1205,6 +1252,7 @@ private void syncLeave(String sid, String mode) {
         logMessage("debug", "Mode sync restore is disabled; system " + sid + " remains in Away.")
         state.modeSyncOwned[sid] = false
         state.modeSnapshots.remove(sid)
+        state.awayZoneSnapshots.remove(sid)
         state.modeSyncPreExistingAway.remove(sid)
         return
     }
@@ -1213,13 +1261,47 @@ private void syncLeave(String sid, String mode) {
     def end = snap.timeUntil ?: snap.until
     Date expiry = end ? parseDate(end.toString()) : null
     if (snap.isPermanent == false && expiry) {
-        if (expiry.after(new Date())) setSystemMode(sid, restore, expiry)
-        else setSystemMode(sid, "auto")
-    } else setSystemMode(sid, restore)
+        if (expiry.after(new Date())) setSystemMode(sid, restore, expiry, true)
+        else setSystemMode(sid, "auto", null, true)
+    } else setSystemMode(sid, restore, null, true)
     logMessage("info", "Hubitat left Away, so I am restoring the Evohome system to " + restore + ".")
     state.modeSyncOwned[sid] = false
     state.modeSnapshots.remove(sid)
     state.modeSyncPreExistingAway.remove(sid)
+}
+
+private void restoreAwayZoneOverrides(String sid, Map systemStatus, String mode) {
+    Map savedZones = (state.awayZoneSnapshots ?: [:])[sid] ?: [:]
+    if (!savedZones) return
+    if (mode in ["off", "away"] || mode == "unknown") {
+        logMessage("debug", "Saved zone overrides for system " + sid + " were not restored because its current mode is " + mode + ".")
+        return
+    }
+    (systemStatus?.zones ?: []).each { zone ->
+        String zid = zone.zoneId?.toString()
+        Map saved = savedZones[zid]
+        if (!saved) return
+        String savedMode = saved.mode?.toString()
+        def target = saved.target
+        Long expiry = savedMode == "TemporaryOverride" ? parseWindowExpiry(saved.until) : null
+        Boolean permanent = savedMode == "PermanentOverride"
+        Boolean temporary = savedMode == "TemporaryOverride" && expiry != null && expiry > now()
+        String zoneLabel = getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)
+        if ((permanent || temporary) && target != null) {
+            def until = permanent ? null : new Date(expiry).format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone("UTC"))
+            apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
+                [HeatSetpointValue: target as BigDecimal, SetpointMode: permanent ? 1 : 2, TimeUntil: until],
+                "zoneWrite", [kind: "zone", id: zid])
+            logMessage("info", "Evohome returned from Away. Restoring " + (permanent ? "the permanent" : "the unexpired temporary") +
+                " override for " + zoneLabel + " to " + target + " °C.")
+        } else {
+            apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
+                [HeatSetpointValue: 0.0, SetpointMode: 0, TimeUntil: null], "zoneClear", [kind: "zone", id: zid])
+            logMessage("info", "The saved temporary override for " + zoneLabel +
+                " expired during Away. Returning the zone to its schedule.")
+        }
+    }
+    state.awayZoneSnapshots.remove(sid)
 }
 
 private Date parseDate(String value) {
