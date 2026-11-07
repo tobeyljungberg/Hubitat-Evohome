@@ -41,6 +41,11 @@ preferences {
                 description: "Turn on for a system without cooling. Zone devices keep the cooling target equal to the heating target and ignore cooling changes, so the two displayed temperatures stay aligned. This setting cannot hide controls that Hubitat's HomeKit integration adds.",
                 defaultValue: true
         }
+        section("Window contact protection") {
+            paragraph "Configure one or more contact sensors for each heating zone. The per-zone selectors appear after Evohome's installation sync has created the zone child devices."
+            href name: "windowContactSetup", page: "windowContactPage", title: "Configure window contacts by zone",
+                description: "Open the zone mapping page. Any open selected contact holds that zone at 5 °C."
+        }
         section("Synchronise Hubitat and Evohome modes") {
             paragraph "These options apply when mode synchronisation is enabled. When Hubitat changes to Away, this app checks the current Evohome mode first. It does nothing if Evohome is already Off or Away. If it changes Evohome to Away, it can restore the previous mode when Hubitat leaves Away."
             input "modeSyncEnabled", "bool", title: "Set Evohome to Away when Hubitat changes to Away",
@@ -72,6 +77,126 @@ preferences {
                 description: "Set the effective log level of every Evohome child device to the Main app log level selected above. Use this after changing child log levels individually."
         }
     }
+}
+
+def windowContactPage() {
+    List zones = windowContactZoneRows()
+    dynamicPage(name: "windowContactPage", title: "Window contacts by zone", install: false, uninstall: false) {
+        if (!zones) {
+            section("Zones not available yet") {
+                paragraph "Evohome zone details are loaded from the account during the first installation sync. Save and install the app, wait for its first successful sync and for the zone child devices to appear, then reopen this page. There is no sensor ID or text value to enter here."
+            }
+        } else {
+            section("How contacts control each zone") {
+                paragraph "Select any contact sensors assigned to each zone. If any selected sensor is open, that zone is held at a permanent 5 °C override. The original schedule or override is restored when all selected sensors close. While Evohome is in system-wide Heating Off, contact actions wait until the system leaves Off."
+            }
+            zones.each { zone ->
+                String settingName = "windowContacts_" + zone.zoneId
+                String title = zone.locationName + " / " + zone.zoneName + " window contacts"
+                section(title) {
+                    input name: settingName, type: "capability.contactSensor",
+                        title: "Contact sensors", description: "Select one or more sensors for this zone.",
+                        multiple: true, required: false, showFilter: true
+                }
+            }
+        }
+    }
+}
+
+private List windowContactZoneRows() {
+    List rows = []
+    (state.installation ?: []).each { loc ->
+        String locationName = loc.locationInfo?.name?.toString() ?: "Evohome location"
+        (loc.gateways ?: []).each { gw ->
+            (gw.temperatureControlSystems ?: []).each { sys ->
+                (sys.zones ?: []).each { zone ->
+                    String zid = zone.zoneId?.toString()
+                    if (zid && getChildDevice(zdni(zid))) {
+                        rows << [zoneId: zid, zoneName: zone.name?.toString() ?: ("Zone " + zid), locationName: locationName]
+                    }
+                }
+            }
+        }
+    }
+    rows.sort { a, b -> (a.locationName + a.zoneName).compareToIgnoreCase(b.locationName + b.zoneName) }
+    rows
+}
+
+private List windowContactsForZone(String zoneId) {
+    def configured = settings["windowContacts_" + zoneId]
+    if (configured instanceof List) return configured
+    configured ? [configured] : []
+}
+
+private void subscribeAppEvents(Boolean refreshZones) {
+    unsubscribe()
+    subscribe(location, "mode", "locationModeChanged")
+    Map sensorZones = [:]
+    Map sensorDevices = [:]
+    Map openStates = state.windowContactOpen ?: [:]
+    Map snapshots = state.windowSnapshots ?: [:]
+    Set zoneIds = (windowContactZoneRows().collect { it.zoneId } + openStates.keySet() + snapshots.keySet()) as Set
+    zoneIds.each { zidValue ->
+        String zid = zidValue.toString()
+        List contacts = windowContactsForZone(zid)
+        contacts.each { contact ->
+            String sensorId = contact.id.toString()
+            List assignedZones = sensorZones[sensorId] ?: []
+            if (!assignedZones.contains(zid)) assignedZones << zid
+            sensorZones[sensorId] = assignedZones
+            sensorDevices[sensorId] = contact
+        }
+        updateWindowZoneState(zid, contacts)
+    }
+    state.windowSensorZones = sensorZones
+    sensorDevices.each { sensorId, sensor -> subscribe(sensor, "contact", "windowSensorEvent") }
+    logMessage("debug", "Subscribed to " + sensorDevices.size() + " unique window contact sensor(s) across " + zoneIds.size() + " zone(s).")
+    if (refreshZones && state.token && state.tokenExpiry && now() < tokenRenewAt()) {
+        Set activeZoneIds = ((sensorZones.values().flatten() ?: []) + snapshots.keySet()) as Set
+        List locationIds = activeZoneIds.collect { getChildDevice(zdni(it.toString()))?.getDataValue("locationId") }.findAll { it }.unique()
+        locationIds.each { getLocation(it.toString(), "windowContacts") }
+    }
+}
+
+private Boolean updateWindowZoneState(String zoneId, List contacts = null) {
+    List selected = contacts == null ? windowContactsForZone(zoneId) : contacts
+    Boolean configured = !selected.isEmpty()
+    Boolean anyOpen = selected.any { it.currentValue("contact")?.toString()?.equalsIgnoreCase("open") }
+    Map openStates = state.windowContactOpen ?: [:]
+    Map snapshots = state.windowSnapshots ?: [:]
+    Map pending = state.pending ?: [:]
+    Boolean previouslyTracked = openStates.containsKey(zoneId)
+    Boolean previousOpen = openStates[zoneId] == true
+    if (configured || previouslyTracked || snapshots[zoneId]) {
+        openStates[zoneId] = anyOpen
+        state.windowContactOpen = openStates
+    } else {
+        openStates.remove(zoneId)
+    }
+    if (!configured && !anyOpen && !snapshots[zoneId] && pending[zoneId]?.action == "windowOpen") {
+        pending.remove(zoneId)
+        state.pending = pending
+    }
+    def child = getChildDevice(zdni(zoneId))
+    child?.setWindowContactOpen(configured, anyOpen)
+    if (previousOpen != anyOpen && (previouslyTracked || anyOpen)) {
+        logMessage("info", "Window contact state changed for " + (child?.displayName ?: ("zone " + zoneId)) +
+            "; any selected contact open=" + anyOpen + ".")
+    } else {
+        logMessage("debug", "Window contact state evaluated for zone " + zoneId + "; selected=" + selected.size() +
+            ", anyOpen=" + anyOpen + ".")
+    }
+    anyOpen
+}
+
+void windowSensorEvent(evt) {
+    String sensorId = evt?.deviceId?.toString()
+    List zones = (state.windowSensorZones ?: [:])[sensorId] ?: []
+    logMessage("debug", "Window contact event received; sensorId=" + sensorId + ", contact=" + evt?.value +
+        ", affectedZones=" + zones.size() + ".")
+    zones.each { updateWindowZoneState(it.toString()) }
+    List locationIds = zones.collect { getChildDevice(zdni(it.toString()))?.getDataValue("locationId") }.findAll { it }.unique()
+    locationIds.each { getLocation(it.toString(), "windowContacts") }
 }
 
 def appButtonHandler(String buttonName) {
@@ -109,6 +234,7 @@ private void initialize() {
     state.windowSnapshots = state.windowSnapshots ?: [:]
     state.windowOverrideApplied = state.windowOverrideApplied ?: [:]
     state.windowRestoreInFlight = state.windowRestoreInFlight ?: [:]
+    state.windowSensorZones = state.windowSensorZones ?: [:]
     state.requestCounter = state.requestCounter ?: 0
     Boolean heatingOnly = settings.heatingOnly != false
     logMessage("debug", "Initialising; API host=" + state.root + ", poll=" + (settings.pollMinutes ?: 5) +
@@ -117,7 +243,7 @@ private void initialize() {
     (getChildDevices() ?: []).findAll { it.deviceNetworkId?.startsWith("Evohome-Z-") }.each {
         it.setHeatingOnly(heatingOnly)
     }
-    subscribe(location, "mode", "locationModeChanged")
+    subscribeAppEvents(true)
     runIn(Math.max(1, (settings.pollMinutes ?: 5) as Integer) * 60, "poll", [overwrite: true])
     runIn(5, "start")
 }
@@ -406,6 +532,7 @@ void apiResponse(resp, Map meta) {
             break
         case "installation":
             installChildren(json)
+            subscribeAppEvents(false)
             (state.locations ?: []).each { getLocation(it.toString(), "poll") }
             refreshSchedules()
             break
@@ -693,30 +820,6 @@ void refreshAfterWrite(Map d) {
         if (lid) getLocation(lid, "poll")
         if (d.kind == "dhw") apiGet("/WebAPI/emea/api/v1/domesticHotWater/" + d.id + "/status", "dhwStatus", [id: d.id])
     }
-}
-
-void windowContactChanged(String dni, Boolean anyOpen) {
-    def child = getChildDevice(dni)
-    String zid = child?.getDataValue("zoneId")
-    if (!zid) {
-        logMessage("warn", "A window contact update arrived for an unknown Evohome zone device " + dni + ".")
-        return
-    }
-    Map openStates = state.windowContactOpen ?: [:]
-    Boolean open = anyOpen == true
-    Boolean previous = openStates[zid]
-    openStates[zid] = open
-    state.windowContactOpen = openStates
-    if (previous != open) {
-        String label = child.displayName ?: ("zone " + zid)
-        if (open) logMessage("info", "A window contact opened for " + label + ". The zone will be held at 5 °C when Evohome is not in Heating Off.")
-        else logMessage("info", "All selected window contacts closed for " + label + ". The previous zone setting will be restored when Evohome is not in Heating Off.")
-    } else {
-        logMessage("debug", "Window contact state reported for zone " + zid + "; anyOpen=" + open + ".")
-    }
-    String locationId = child.getDataValue("locationId")
-    if (locationId) getLocation(locationId, "windowContacts", [zoneId: zid])
-    else logMessage("debug", "Window contact state stored for zone " + zid + "; waiting for its location ID before reconciling Evohome.")
 }
 
 private void reconcileWindowOverride(String zid, String systemMode) {
