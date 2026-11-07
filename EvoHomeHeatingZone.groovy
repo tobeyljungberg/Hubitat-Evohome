@@ -20,6 +20,7 @@ metadata {
         attribute "evohomeSetpointModeDescription", "string"
         attribute "evohomeUntil", "string"
         attribute "heatingOnly", "string"
+        attribute "windowContactState", "string"
         attribute "nextScheduledTime", "string"
         attribute "nextScheduledSetpoint", "number"
         attribute "thermostatSetpointStatus", "string"
@@ -36,6 +37,9 @@ metadata {
         command "setSchedule", ["JSON_OBJECT"]
     }
     preferences {
+        input name: "windowContacts", type: "capability.contactSensor", title: "Window contact sensors",
+            description: "Select one or more contacts for this zone. Any open contact holds the zone at 5 °C; the previous schedule or unexpired override is restored when all selected contacts close.",
+            multiple: true, required: false
         input name: "setpointPolicy", type: "enum", title: "Setpoint change behaviour",
             options: ["preserve": "Preserve an existing override; otherwise until next schedule change",
                       "next": "Until next schedule change", "permanent": "Permanent override",
@@ -54,6 +58,7 @@ def installed() {
     state.lastPrefLogLevel = settings.prefLogLevel ?: "info"
     sendEvent(name: "loggingLevel", value: state.logLevel)
     setHeatingOnly(true)
+    configureWindowContacts()
 }
 
 def updated() {
@@ -62,6 +67,39 @@ def updated() {
     if (!state.logLevel) state.logLevel = configured
     state.lastPrefLogLevel = configured
     sendEvent(name: "loggingLevel", value: state.logLevel)
+    configureWindowContacts()
+}
+
+private void configureWindowContacts() {
+    unsubscribe()
+    List contacts = selectedWindowContacts()
+    contacts.each { contact -> subscribe(contact, "contact", "windowContactChanged") }
+    Boolean notifyParent = !contacts.isEmpty() || state.windowContactsConfigured == true
+    state.windowContactsConfigured = !contacts.isEmpty()
+    logMessage("debug", "Configured " + contacts.size() + " window contact sensor(s) for this zone.")
+    evaluateWindowContacts(notifyParent)
+}
+
+private List selectedWindowContacts() {
+    def configured = settings.windowContacts
+    if (configured instanceof List) return configured
+    configured ? [configured] : []
+}
+
+void windowContactChanged(evt) {
+    logMessage("debug", "Window contact event received; sensor=" + evt.displayName + ", contact=" + evt.value + ".")
+    evaluateWindowContacts()
+}
+
+private void evaluateWindowContacts(Boolean notifyParent = true) {
+    List contacts = selectedWindowContacts()
+    Boolean anyOpen = contacts.any { it.currentValue("contact")?.toString()?.equalsIgnoreCase("open") }
+    state.windowContactOpen = anyOpen
+    String contactState = contacts ? (anyOpen ? "Open" : "Closed") : "Not configured"
+    sendEvent(name: "windowContactState", value: contactState)
+    logMessage("debug", "Window contact state evaluated; selected=" + contacts.size() +
+        ", anyOpen=" + anyOpen + ".")
+    if (notifyParent) parent.windowContactChanged(device.deviceNetworkId, anyOpen)
 }
 
 void setLogLevel(String level) {
@@ -116,6 +154,19 @@ void setNextScheduledTime(String value) {
 void setNextScheduledSetpoint(Number value) {
     logMessage("debug", "Next scheduled setpoint received from parent: " + value + " C.")
     sendEvent(name: "nextScheduledSetpoint", value: value, unit: "°C")
+}
+
+void setWindowContactOverride(Boolean active, Number value, String thermostatMode, Boolean pending = true) {
+    state.zoneOff = thermostatMode == "off"
+    if (value != null) {
+        sendEvent(name: "heatingSetpoint", value: value, unit: "°C")
+        sendEvent(name: "thermostatSetpoint", value: value, unit: "°C")
+        if (heatingOnlyEnabled()) sendEvent(name: "coolingSetpoint", value: value, unit: "°C")
+    }
+    sendEvent(name: "thermostatMode", value: thermostatMode ?: "auto")
+    sendEvent(name: "thermostatSetpointStatus", value: pending ? "Pending" : "Current")
+    logMessage("debug", "Window-contact thermostat state updated; active=" + active +
+        ", setpoint=" + value + " C, thermostatMode=" + thermostatMode + ", pending=" + pending + ".")
 }
 
 void setSchedule(Map schedule) {
@@ -189,6 +240,11 @@ private String readableFault(String faultType) {
 void setHeatingSetpoint(BigDecimal requested) {
     logMessage("debug", "setHeatingSetpoint() received; requested=" + requested + " C, systemMode=" +
         device.currentValue("evohomeSystemMode") + ".")
+    if (state.windowContactOpen == true) {
+        logMessage("info", "A window contact for " + device.displayName +
+            " is open, so the requested temperature change was ignored while the zone is held at 5 °C.")
+        return
+    }
     Long coolingRequestAt = state.lastHomeKitCoolingRequestAt as Long
     BigDecimal coolingRequest = state.lastHomeKitCoolingRequest as BigDecimal
     if (heatingOnlyEnabled() && coolingRequestAt != null && coolingRequest != null &&
@@ -227,6 +283,11 @@ void setThermostatMode(String mode) {
     String m = (mode ?: "").toLowerCase()
     logMessage("debug", "setThermostatMode() received; requestedMode=" + m +
         ", systemMode=" + device.currentValue("evohomeSystemMode") + ".")
+    if (state.windowContactOpen == true) {
+        logMessage("info", "A window contact for " + device.displayName +
+            " is open, so the requested thermostat mode change was ignored while the zone is held at 5 °C.")
+        return
+    }
     if (systemHeatingOff()) {
         logMessage("info", "Evohome is in Heating Off, so the requested mode change for this zone was ignored.")
         refresh()

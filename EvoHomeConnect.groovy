@@ -105,6 +105,10 @@ private void initialize() {
     state.modeSyncOwned = state.modeSyncOwned ?: [:]
     state.modeSyncPreExistingAway = state.modeSyncPreExistingAway ?: [:]
     state.faultSnapshot = state.faultSnapshot ?: [:]
+    state.windowContactOpen = state.windowContactOpen ?: [:]
+    state.windowSnapshots = state.windowSnapshots ?: [:]
+    state.windowOverrideApplied = state.windowOverrideApplied ?: [:]
+    state.windowRestoreInFlight = state.windowRestoreInFlight ?: [:]
     state.requestCounter = state.requestCounter ?: 0
     Boolean heatingOnly = settings.heatingOnly != false
     logMessage("debug", "Initialising; API host=" + state.root + ", poll=" + (settings.pollMinutes ?: 5) +
@@ -347,6 +351,7 @@ void apiResponse(resp, Map meta) {
             state.pending?.remove(meta.zoneId?.toString())
             getChildDevice(zdni(meta.zoneId?.toString()))?.refresh()
         } else if (action in ["zoneWrite", "zoneClear", "systemWrite", "dhwWrite"]) {
+            if (action in ["zoneWrite", "zoneClear"]) handleWindowWriteResponse(meta, false)
             runIn(5, "poll", [overwrite: true])
         }
         return
@@ -360,6 +365,7 @@ void apiResponse(resp, Map meta) {
             ", Content-Type: " + responseType
         if (locationEntry?.value) detail += ", redirect: " + locationEntry.value
         logMessage("error", detail)
+        if (action in ["zoneWrite", "zoneClear"] && meta?.windowAction) handleWindowWriteResponse(meta, false)
         if (action == "auth" && meta?.grant == "refresh_token") {
             fallbackToPasswordAuth("non-JSON authentication response")
         } else if (action == "auth") {
@@ -413,6 +419,7 @@ void apiResponse(resp, Map meta) {
         case "zoneClear":
         case "systemWrite":
         case "dhwWrite":
+            if (action in ["zoneWrite", "zoneClear"]) handleWindowWriteResponse(meta, true)
             logMessage("debug", "[" + requestId + "] Write response received for kind=" + meta.kind +
                 ", id=" + meta.id + "; scheduling state reconciliation in " + (settings.settleSeconds ?: 8) + "s.")
             runIn(Math.max(2, (settings.settleSeconds ?: 8) as Integer), "refreshAfterWrite",
@@ -568,7 +575,11 @@ private void acceptLocation(def payload, String locationId, String reason, Map m
             def controller = getChildDevice(sdni(sid))
             processFaults("system", sid, controller?.displayName ?: "Evohome system", sys.activeFaults)
             controller?.parseSystemStatus(mode, ms, sys.activeFaults)
-            (sys.zones ?: []).each { publishZone(it as Map, it.zoneId.toString(), mode) }
+            (sys.zones ?: []).each {
+                String zid = it.zoneId.toString()
+                publishZone(it as Map, zid, mode)
+                reconcileWindowOverride(zid, mode)
+            }
             if (sys.dhw?.dhwId) {
                 String hid = sys.dhw.dhwId.toString()
                 def hot = getChildDevice(hdni(hid))
@@ -589,8 +600,12 @@ private void preflightZoneWrite(String zid, String mode) {
     if (!pending) return
     if (mode == "off") {
         state.pending.remove(zid)
-        getChildDevice(pending.dni)?.refresh()
-        logMessage("info", "Evohome is in Heating Off, so the requested change for zone " + zid + " was ignored.")
+        if (pending.action in ["windowOpen", "windowRestore"]) {
+            logMessage("info", "Evohome is in Heating Off, so the window contact action for zone " + zid + " was deferred until the system leaves Off.")
+        } else {
+            getChildDevice(pending.dni)?.refresh()
+            logMessage("info", "Evohome is in Heating Off, so the requested change for zone " + zid + " was ignored.")
+        }
         return
     }
     apiGet("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/status", "zoneBeforeWrite",
@@ -609,6 +624,11 @@ private void publishZone(Map z, String zid, String systemMode = null) {
     if ((state.pending ?: [:])[zid]) {
         values.heatingSetpoint = null
         values.setpointMode = null
+        values.until = null
+    }
+    if ((state.windowOverrideApplied ?: [:])[zid] == true) {
+        values.heatingSetpoint = 5.0
+        values.setpointMode = "PermanentOverride"
         values.until = null
     }
     child.parseEvohomeStatus(values)
@@ -675,6 +695,124 @@ void refreshAfterWrite(Map d) {
     }
 }
 
+void windowContactChanged(String dni, Boolean anyOpen) {
+    def child = getChildDevice(dni)
+    String zid = child?.getDataValue("zoneId")
+    if (!zid) {
+        logMessage("warn", "A window contact update arrived for an unknown Evohome zone device " + dni + ".")
+        return
+    }
+    Map openStates = state.windowContactOpen ?: [:]
+    Boolean open = anyOpen == true
+    Boolean previous = openStates[zid]
+    openStates[zid] = open
+    state.windowContactOpen = openStates
+    if (previous != open) {
+        String label = child.displayName ?: ("zone " + zid)
+        if (open) logMessage("info", "A window contact opened for " + label + ". The zone will be held at 5 °C when Evohome is not in Heating Off.")
+        else logMessage("info", "All selected window contacts closed for " + label + ". The previous zone setting will be restored when Evohome is not in Heating Off.")
+    } else {
+        logMessage("debug", "Window contact state reported for zone " + zid + "; anyOpen=" + open + ".")
+    }
+    String locationId = child.getDataValue("locationId")
+    if (locationId) getLocation(locationId, "windowContacts", [zoneId: zid])
+    else logMessage("debug", "Window contact state stored for zone " + zid + "; waiting for its location ID before reconciling Evohome.")
+}
+
+private void reconcileWindowOverride(String zid, String systemMode) {
+    Map openStates = state.windowContactOpen ?: [:]
+    Map snapshots = state.windowSnapshots ?: [:]
+    Map appliedStates = state.windowOverrideApplied ?: [:]
+    Map restoreInFlight = state.windowRestoreInFlight ?: [:]
+    if (!openStates.containsKey(zid) && !snapshots.containsKey(zid)) return
+    Boolean open = openStates[zid] == true
+    Map pending = (state.pending ?: [:])[zid]
+    if (systemMode == "off") {
+        if (open || snapshots[zid]) {
+            logMessage("debug", "Window contact action for zone " + zid + " is deferred while Evohome is in Heating Off.")
+        }
+        return
+    }
+    if (open) {
+        if (!snapshots[zid] || appliedStates[zid] != true) {
+            queueWindowAction(zid, "windowOpen")
+        }
+        return
+    }
+    if (!snapshots[zid]) {
+        if (pending?.action == "windowOpen") {
+            (state.pending ?: [:]).remove(zid)
+            logMessage("debug", "Cancelled the pending window-open override for zone " + zid + " because all contacts closed before the override was applied.")
+        }
+        return
+    }
+    if (appliedStates[zid] == true && restoreInFlight[zid] != true) {
+        queueWindowAction(zid, "windowRestore")
+    } else if (appliedStates[zid] != true) {
+        snapshots.remove(zid)
+        state.windowSnapshots = snapshots
+        logMessage("debug", "Discarded the saved window restore point for zone " + zid + " because its 5 C override was never applied.")
+    }
+}
+
+private void queueWindowAction(String zid, String action) {
+    Map pending = state.pending ?: [:]
+    Map previous = pending[zid] ?: [version: 0]
+    if (previous.action == action) return
+    String dni = zdni(zid)
+    pending[zid] = [zoneId: zid, dni: dni, action: action, version: (previous.version as Integer) + 1]
+    state.pending = pending
+    logMessage("debug", "Queued window contact action for zone " + zid + "; action=" + action + ", version=" + pending[zid].version + ".")
+    runIn(1, "flushZone", [data: [zoneId: zid], overwrite: true])
+}
+
+private Long parseWindowExpiry(def value) {
+    if (value instanceof Date) return value.time
+    String text = value?.toString()
+    if (!text) return null
+    for (String pattern : ["yyyy-MM-dd'T'HH:mm:ssX", "yyyy-MM-dd'T'HH:mm:ss.SSSX", "yyyy-MM-dd'T'HH:mm:ss'Z'"]) {
+        try {
+            java.text.SimpleDateFormat format = new java.text.SimpleDateFormat(pattern)
+            format.setTimeZone(TimeZone.getTimeZone("UTC"))
+            return format.parse(text).time
+        } catch (Exception ignored) { }
+    }
+    null
+}
+
+private void handleWindowWriteResponse(Map meta, Boolean success) {
+    String windowAction = meta?.windowAction?.toString()
+    String zid = meta?.id?.toString()
+    if (!windowAction || !zid) return
+    Map applied = state.windowOverrideApplied ?: [:]
+    Map snapshots = state.windowSnapshots ?: [:]
+    Map restoreInFlight = state.windowRestoreInFlight ?: [:]
+    if (windowAction == "open") {
+        applied[zid] = success == true
+        state.windowOverrideApplied = applied
+        if (!success) logMessage("warn", "The window-open 5 C override for zone " + zid + " was not accepted; it will be retried while a contact remains open.")
+        else if (state.windowContactOpen[zid] != true) reconcileWindowOverride(zid, currentSystemMode(getChildDevice(zdni(zid))?.getDataValue("systemId")))
+    } else if (windowAction == "restore") {
+        restoreInFlight[zid] = false
+        state.windowRestoreInFlight = restoreInFlight
+        if (success) {
+            applied[zid] = false
+            state.windowOverrideApplied = applied
+            if (state.windowContactOpen[zid] == true) {
+                reconcileWindowOverride(zid, currentSystemMode(getChildDevice(zdni(zid))?.getDataValue("systemId")))
+            } else {
+                snapshots.remove(zid)
+                state.windowSnapshots = snapshots
+                logMessage("debug", "Cleared the saved window restore point for zone " + zid + " after Evohome accepted the restored setting.")
+            }
+        } else {
+            applied[zid] = true
+            state.windowOverrideApplied = applied
+            logMessage("warn", "The saved setting for zone " + zid + " was not restored; it will be retried while all contacts remain closed.")
+        }
+    }
+}
+
 void requestZoneSetpoint(String dni, BigDecimal value, String policy) {
     def child = getChildDevice(dni)
     String zid = child?.getDataValue("zoneId")
@@ -718,6 +856,88 @@ private void flushZone(Map d) {
     getLocation(locationId, "zonePreflight", [zoneId: d.zoneId.toString()])
 }
 
+private void writeWindowOpen(String zid, Map pending, Map fresh) {
+    if (state.windowContactOpen[zid] != true) {
+        state.pending.remove(zid)
+        logMessage("debug", "Cancelled window-open write for zone " + zid + " because all selected contacts are now closed.")
+        return
+    }
+    Map snapshots = state.windowSnapshots ?: [:]
+    if (!snapshots[zid]) {
+        Map sp = fresh.heatSetpointStatus ?: fresh.setpointStatus ?: [:]
+        snapshots[zid] = [mode: sp.setpointMode?.toString() ?: "FollowSchedule",
+            target: sp.targetTemperature ?: sp.targetHeatTemperature,
+            until: sp.until ?: sp.timeUntil]
+        state.windowSnapshots = snapshots
+        logMessage("debug", "Saved pre-window state for zone " + zid + "; mode=" + snapshots[zid].mode +
+            ", target=" + (snapshots[zid].target ?: "not reported") + " C, until=" + (snapshots[zid].until ?: "none") + ".")
+    }
+    Map applied = state.windowOverrideApplied ?: [:]
+    applied[zid] = true
+    state.windowOverrideApplied = applied
+    getChildDevice(pending.dni)?.setWindowContactOverride(true, 5.0G, "off", true)
+    apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
+        [HeatSetpointValue: 5.0, SetpointMode: 1, TimeUntil: null], "zoneWrite",
+        [kind: "zone", id: zid, version: pending.version, windowAction: "open"])
+    String label = getChildDevice(pending.dni)?.displayName ?: ("zone " + zid)
+    logMessage("info", "A selected window contact is open for " + label + ". Setting the zone to a permanent 5 °C override.")
+    logMessage("debug", "Window-open override sent; zoneId=" + zid + ", setpoint=5.0 C, permanent=true.")
+    state.pending.remove(zid)
+}
+
+private void writeWindowRestore(String zid, Map pending) {
+    if (state.windowContactOpen[zid] == true) {
+        state.pending.remove(zid)
+        logMessage("debug", "Cancelled window restore for zone " + zid + " because a selected contact is open again.")
+        return
+    }
+    Map snapshot = (state.windowSnapshots ?: [:])[zid]
+    if (!snapshot) {
+        state.pending.remove(zid)
+        logMessage("debug", "No saved pre-window state exists for zone " + zid + "; no restore command is needed.")
+        return
+    }
+    String savedMode = snapshot.mode?.toString() ?: "FollowSchedule"
+    def until = snapshot.until
+    Long expiry = savedMode == "TemporaryOverride" ? parseWindowExpiry(until) : null
+    Boolean restoreTemporary = savedMode == "TemporaryOverride" && expiry != null && expiry > now()
+    Boolean restorePermanent = savedMode == "PermanentOverride"
+    if (restoreTemporary && snapshot.target == null) {
+        logMessage("warn", "The saved temporary target for zone " + zid + " is missing; returning the zone to its schedule.")
+        restoreTemporary = false
+    }
+    if (savedMode == "TemporaryOverride" && !restoreTemporary) {
+        logMessage("info", "The saved temporary override for zone " + zid + " has expired or has no usable expiry. Returning the zone to its schedule.")
+    }
+    if (restorePermanent && snapshot.target == null) {
+        logMessage("warn", "The saved permanent target for zone " + zid + " is missing; returning the zone to its schedule.")
+        restorePermanent = false
+    }
+    Map restoreInFlight = state.windowRestoreInFlight ?: [:]
+    restoreInFlight[zid] = true
+    state.windowRestoreInFlight = restoreInFlight
+    if (restorePermanent || restoreTemporary) {
+        Integer mode = restorePermanent ? 1 : 2
+        def target = snapshot.target as BigDecimal
+        def restoreUntil = restorePermanent ? null : until
+        String thermostatMode = restorePermanent && target.compareTo(5.0G) == 0 ? "off" : "heat"
+        getChildDevice(zdni(zid))?.setWindowContactOverride(false, target, thermostatMode, true)
+        apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
+            [HeatSetpointValue: target, SetpointMode: mode, TimeUntil: restoreUntil], "zoneWrite",
+            [kind: "zone", id: zid, version: pending.version, windowAction: "restore"])
+        logMessage("info", "All selected window contacts are closed. Restoring zone " + zid + " to " + target +
+            " °C with its saved " + (restorePermanent ? "permanent" : "temporary") + " override.")
+    } else {
+        BigDecimal scheduledTarget = snapshot.target != null ? snapshot.target as BigDecimal : null
+        getChildDevice(zdni(zid))?.setWindowContactOverride(false, scheduledTarget, "auto", true)
+        apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
+            [HeatSetpointValue: 0.0, SetpointMode: 0, TimeUntil: null], "zoneClear",
+            [kind: "zone", id: zid, version: pending.version, windowAction: "restore"])
+        logMessage("info", "All selected window contacts are closed. Clearing the override for zone " + zid + " and returning it to its schedule.")
+    }
+    state.pending.remove(zid)
+}
+
 private void writePendingZone(Map meta, Map fresh) {
     String zid = meta.zoneId.toString()
     Map p = (state.pending ?: [:])[zid]
@@ -729,6 +949,14 @@ private void writePendingZone(Map meta, Map fresh) {
         logMessage("debug", "Zone preflight is stale; zoneId=" + zid + ", responseVersion=" + meta.version +
             ", currentVersion=" + p.version + ". Re-fetching latest requested value.")
         runIn(1, "flushZone", [data: [zoneId: zid], overwrite: true])
+        return
+    }
+    if (p.action == "windowOpen") {
+        writeWindowOpen(zid, p, fresh)
+        return
+    }
+    if (p.action == "windowRestore") {
+        writeWindowRestore(zid, p)
         return
     }
     if (p.action == "clear") {

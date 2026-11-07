@@ -35,6 +35,8 @@ The main app's heating-only option defaults to on. With it enabled, zone child d
 
 Zone child devices expose `nextScheduledTime` and `nextScheduledSetpoint` from the downloaded weekly schedule. These show the upcoming schedule transition used by the "until next schedule change" setpoint policy.
 
+Each heating-zone child can be assigned one or more Window contact sensors in its device preferences. If any selected contact is open, the integration applies a permanent 5 °C override to that zone and ignores manual zone setpoint or mode changes until all selected contacts are closed. It then restores the state saved before the first contact opened: schedule-following zones resume their schedule, permanent overrides are restored, and temporary overrides are restored only if their original expiry is still in the future. If Evohome is in system-wide Heating Off, contact actions are deferred; an open contact is applied when the system leaves Off, and a saved zone setting is restored when appropriate.
+
 ## API and operation notes
 
 The EMEA evohome API is undocumented. The app's API host setting takes an origin only, such as `https://mytotalconnectcomfort.com`, without a `/WebApi` path. Authentication sends a URL-encoded form body to match the original working app; Hubitat's asynchronous HTTP methods serialise Map bodies as JSON. Validate the authentication response, status JSON and write acknowledgements on a test installation before replacing a live integration. The API calls are asynchronous; commands update child state immediately, are coalesced during the debounce window, and schedule a later refresh.
