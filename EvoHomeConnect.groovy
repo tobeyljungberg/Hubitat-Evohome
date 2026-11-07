@@ -76,7 +76,7 @@ preferences {
         }
         section("Logging") {
             input "prefLogLevel", "enum", title: "Main app log level",
-                description: "Choose the detail recorded by the main app. Info gives readable activity messages; Debug adds API calls, responses and processing details. Child devices keep their own levels until you use Reset Logging.",
+                description: "Error shows errors only. Warn adds warnings; Info adds readable activity messages; Debug adds API calls, responses and processing details. Each level includes all more severe categories. Child devices keep their own levels until you use Reset Logging.",
                 options: ["error", "warn", "info", "debug"], defaultValue: "info"
             input "resetChildLogging", "button", title: "Reset Logging",
                 description: "Set the effective log level of every Evohome child device to the Main app log level selected above. Use this after changing child log levels individually."
@@ -209,8 +209,9 @@ private Boolean updateWindowZoneState(String zoneId, List contacts = null) {
     def child = getChildDevice(zdni(zoneId))
     child?.setWindowContactOpen(configured, anyOpen)
     if (previousOpen != anyOpen && (previouslyTracked || anyOpen)) {
-        logMessage("info", "Window contact state changed for " + (child?.displayName ?: ("zone " + zoneId)) +
-            "; any selected contact open=" + anyOpen + ".")
+        String zoneLabel = child?.displayName ?: ("zone " + zoneId)
+        if (anyOpen) logMessage("info", "A selected window contact for " + zoneLabel + " opened. The zone will be held at a permanent 5 °C override once Evohome allows the change.")
+        else logMessage("info", "All selected window contacts for " + zoneLabel + " are closed. The saved zone setting will be restored once Evohome allows the change.")
     } else {
         logMessage("debug", "Window contact state evaluated for zone " + zoneId + "; selected=" + selected.size() +
             ", anyOpen=" + anyOpen + ".")
@@ -235,15 +236,17 @@ def appButtonHandler(String buttonName) {
 private void resetChildLogging() {
     String level = (settings.prefLogLevel ?: "info").toLowerCase()
     List children = getChildDevices() ?: []
+    Integer updatedCount = 0
     children.each { child ->
         try {
             child.setLogLevel(level)
+            updatedCount++
         } catch (Exception e) {
             logMessage("warn", "Could not reset logging for " + child.displayName + ": " + e.message + ".")
         }
     }
-    logMessage("info", "Reset Logging set the log level of " + children.size() +
-        " Evohome child device(s) to " + level.capitalize() + ".")
+    logMessage("info", "Reset Logging set the effective log level to " + level.capitalize() + " for " +
+        updatedCount + " of " + children.size() + " Evohome child device(s).")
 }
 
 def installed() { initialize() }
@@ -280,9 +283,12 @@ private void initialize() {
 
 private void logMessage(String level, String message) {
     Map rank = [error: 1, warn: 2, info: 3, debug: 4]
-    String selected = (settings.prefLogLevel ?: "info").toLowerCase()
-    if ((rank[level] ?: 4) <= (rank[selected] ?: 3)) {
-        switch (level) {
+    String selected = (settings.prefLogLevel ?: "info").toString().toLowerCase()
+    String category = (level ?: "debug").toString().toLowerCase()
+    if (!rank.containsKey(selected)) selected = "info"
+    if (!rank.containsKey(category)) category = "debug"
+    if (rank[category] <= rank[selected]) {
+        switch (category) {
             case "error": log.error "Evohome Connect: " + message; break
             case "warn": log.warn "Evohome Connect: " + message; break
             case "info": log.info "Evohome Connect: " + message; break
@@ -492,7 +498,7 @@ void apiResponse(resp, Map meta) {
         def errorLocation = responseHeaders.find { key, value -> key?.toString()?.equalsIgnoreCase("Location") }
         String failure = "[" + requestId + "] " + action + " failed; HTTP " + (resp?.status ?: "transport error")
         if (errorLocation?.value) failure += ", redirect: " + errorLocation.value
-        logMessage("warn", failure)
+        logMessage("error", failure)
         if (action == "auth") {
             if (meta?.grant == "refresh_token") fallbackToPasswordAuth("HTTP " + (resp?.status ?: "transport error"))
             else clearAccessToken("password authentication failed with HTTP " + (resp?.status ?: "transport error"))
@@ -758,11 +764,12 @@ private void preflightZoneWrite(String zid, String mode) {
     if (!pending) return
     if (mode == "off") {
         state.pending.remove(zid)
+        String zoneLabel = getChildDevice(pending.dni)?.displayName ?: ("zone " + zid)
         if (pending.action in ["windowOpen", "windowRestore"]) {
-            logMessage("info", "Evohome is in Heating Off, so the window contact action for zone " + zid + " was deferred until the system leaves Off.")
+            logMessage("info", "Evohome is in Heating Off, so the window contact action for " + zoneLabel + " is deferred until the system leaves Off.")
         } else {
             getChildDevice(pending.dni)?.refresh()
-            logMessage("info", "Evohome is in Heating Off, so the requested change for zone " + zid + " was ignored.")
+            logMessage("info", "Evohome is in Heating Off, so the requested change for " + zoneLabel + " was ignored.")
         }
         return
     }
@@ -810,8 +817,9 @@ private void processFaults(String kind, String id, String label, def faults) {
     if (!added) return
     added.each { fault ->
         String text = readableFault(fault.faultType.toString())
-        String message = "evohome fault: " + label + ": " + text
-        if (fault.since) message += " (since " + fault.since + ")"
+        String message = "Evohome reported " + text + " for " + label
+        if (fault.since) message += " since " + fault.since
+        message += "."
         logMessage("warn", message)
         (settings.faultNotifyDevices ?: []).each { notifier ->
             try { notifier.deviceNotification(message) }
@@ -925,7 +933,8 @@ private void handleWindowWriteResponse(Map meta, Boolean success) {
     if (windowAction == "open") {
         applied[zid] = success == true
         state.windowOverrideApplied = applied
-        if (!success) logMessage("warn", "The window-open 5 C override for zone " + zid + " was not accepted; it will be retried while a contact remains open.")
+        if (!success) logMessage("warn", "The window-open 5 °C override for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
+            " was not accepted. It will be retried while a contact remains open.")
         else if (state.windowContactOpen[zid] != true) reconcileWindowOverride(zid, currentSystemMode(getChildDevice(zdni(zid))?.getDataValue("systemId")))
     } else if (windowAction == "restore") {
         restoreInFlight[zid] = false
@@ -943,7 +952,8 @@ private void handleWindowWriteResponse(Map meta, Boolean success) {
         } else {
             applied[zid] = true
             state.windowOverrideApplied = applied
-            logMessage("warn", "The saved setting for zone " + zid + " was not restored; it will be retried while all contacts remain closed.")
+            logMessage("warn", "The saved setting for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
+                " was not restored. It will be retried while all contacts remain closed.")
         }
     }
 }
@@ -1038,19 +1048,28 @@ private void writeWindowRestore(String zid, Map pending) {
     Boolean restoreTemporary = savedMode == "TemporaryOverride" && expiry != null && expiry > now()
     Boolean restorePermanent = savedMode == "PermanentOverride"
     if (restoreTemporary && snapshot.target == null) {
-        logMessage("warn", "The saved temporary target for zone " + zid + " is missing; returning the zone to its schedule.")
+        logMessage("warn", "The saved temporary target for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
+            " is missing. Returning the zone to its schedule.")
         restoreTemporary = false
     }
     if (savedMode == "TemporaryOverride" && !restoreTemporary) {
-        logMessage("info", "The saved temporary override for zone " + zid + " has expired or has no usable expiry. Returning the zone to its schedule.")
+        if (expiry != null && expiry <= now()) {
+            logMessage("info", "The saved temporary override for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
+                " expired while the window was open. Returning the zone to its schedule.")
+        } else if (expiry == null) {
+            logMessage("warn", "The saved temporary override for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
+                " has no usable expiry. Returning the zone to its schedule.")
+        }
     }
     if (restorePermanent && snapshot.target == null) {
-        logMessage("warn", "The saved permanent target for zone " + zid + " is missing; returning the zone to its schedule.")
+        logMessage("warn", "The saved permanent target for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
+            " is missing. Returning the zone to its schedule.")
         restorePermanent = false
     }
     Map restoreInFlight = state.windowRestoreInFlight ?: [:]
     restoreInFlight[zid] = true
     state.windowRestoreInFlight = restoreInFlight
+    String zoneLabel = getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)
     if (restorePermanent || restoreTemporary) {
         Integer mode = restorePermanent ? 1 : 2
         def target = snapshot.target as BigDecimal
@@ -1060,7 +1079,7 @@ private void writeWindowRestore(String zid, Map pending) {
         apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
             [HeatSetpointValue: target, SetpointMode: mode, TimeUntil: restoreUntil], "zoneWrite",
             [kind: "zone", id: zid, version: pending.version, windowAction: "restore"])
-        logMessage("info", "All selected window contacts are closed. Restoring zone " + zid + " to " + target +
+        logMessage("info", "All selected window contacts are closed. Restoring " + zoneLabel + " to " + target +
             " °C with its saved " + (restorePermanent ? "permanent" : "temporary") + " override.")
     } else {
         BigDecimal scheduledTarget = snapshot.target != null ? snapshot.target as BigDecimal : null
@@ -1068,7 +1087,7 @@ private void writeWindowRestore(String zid, Map pending) {
         apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
             [HeatSetpointValue: 0.0, SetpointMode: 0, TimeUntil: null], "zoneClear",
             [kind: "zone", id: zid, version: pending.version, windowAction: "restore"])
-        logMessage("info", "All selected window contacts are closed. Clearing the override for zone " + zid + " and returning it to its schedule.")
+        logMessage("info", "All selected window contacts are closed. Clearing the override for " + zoneLabel + " and returning it to its schedule.")
     }
     state.pending.remove(zid)
 }
@@ -1122,7 +1141,8 @@ private void writePendingZone(Map meta, Map fresh) {
         until = getChildDevice(zdni(zid))?.currentValue("nextScheduledTime")
         if (!until && policy == "preserve" && (sp.until || sp.timeUntil)) until = sp.until ?: sp.timeUntil
         if (!until && mode == 2) {
-            logMessage("warn", "No next switchpoint is known for zone " + zid + "; cancelled setpoint write.")
+            logMessage("warn", "No next scheduled change is known for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
+                ". The temporary setpoint request was cancelled.")
             state.pending.remove(zid)
             getChildDevice(p.dni)?.refresh()
             return
@@ -1164,7 +1184,10 @@ void setDhw(String id, String desired, def until = null) {
         apiPut("/WebAPI/emea/api/v1/domesticHotWater/" + id + "/state",
             [Mode: "FollowSchedule", State: "", UntilTime: null], "dhwWrite", [kind: "dhw", id: id]); return
     }
-    if (!(v in ["on", "off"])) return
+    if (!(v in ["on", "off"])) {
+        logMessage("warn", "Ignoring unsupported hot-water state request: " + v + ".")
+        return
+    }
     logMessage("info", "Hot water was requested to turn " + v +
         (until ? " for " + until + " minute(s)." : " permanently."))
     Boolean permanent = !until || until == 0 || until == "permanent"
@@ -1215,7 +1238,8 @@ private void syncEnter(String sid, String mode, Map snapshot, Map systemStatus) 
     state.awayZoneSnapshots[sid] = savedZones
     state.modeSnapshots[sid] = snapshot
     state.modeSyncOwned[sid] = true
-    logMessage("info", "Hubitat changed to Away, setting Evohome to Away. I saved the current Evohome mode so it can be restored when Hubitat leaves Away.")
+    logMessage("info", "Hubitat changed to Away. Setting Evohome to Away and saving its current system mode for return; " +
+        "saved current overrides for " + savedZones.size() + " zone(s).")
     setSystemMode(sid, "away", (settings.awayDurationDays ?: 0) as Integer)
 }
 
@@ -1260,11 +1284,15 @@ private void syncLeave(String sid, String mode) {
     String restore = normalMode(snap.mode?.toString())
     def end = snap.timeUntil ?: snap.until
     Date expiry = end ? parseDate(end.toString()) : null
+    String restoreTarget = restore
     if (snap.isPermanent == false && expiry) {
         if (expiry.after(new Date())) setSystemMode(sid, restore, expiry, true)
-        else setSystemMode(sid, "auto", null, true)
-    } else setSystemMode(sid, restore, null, true)
-    logMessage("info", "Hubitat left Away, so I am restoring the Evohome system to " + restore + ".")
+        else {
+            restoreTarget = "auto"
+            setSystemMode(sid, restoreTarget, null, true)
+        }
+    } else setSystemMode(sid, restoreTarget, null, true)
+    logMessage("info", "Hubitat left Away, so I am restoring the Evohome system to " + restoreTarget + ".")
     state.modeSyncOwned[sid] = false
     state.modeSnapshots.remove(sid)
     state.modeSyncPreExistingAway.remove(sid)
@@ -1297,8 +1325,16 @@ private void restoreAwayZoneOverrides(String sid, Map systemStatus, String mode)
         } else {
             apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
                 [HeatSetpointValue: 0.0, SetpointMode: 0, TimeUntil: null], "zoneClear", [kind: "zone", id: zid])
-            logMessage("info", "The saved temporary override for " + zoneLabel +
-                " expired during Away. Returning the zone to its schedule.")
+            if (savedMode == "TemporaryOverride" && expiry != null && expiry <= now()) {
+                logMessage("info", "The saved temporary override for " + zoneLabel +
+                    " expired during Away. Returning the zone to its schedule.")
+            } else if (savedMode == "TemporaryOverride" && expiry == null) {
+                logMessage("warn", "The saved temporary override for " + zoneLabel +
+                    " has no usable expiry. Returning the zone to its schedule.")
+            } else {
+                logMessage("warn", "The saved override for " + zoneLabel +
+                    " has no usable target. Returning the zone to its schedule.")
+            }
         }
     }
     state.awayZoneSnapshots.remove(sid)
