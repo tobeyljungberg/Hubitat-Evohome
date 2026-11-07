@@ -1,17 +1,17 @@
-# Evohome Hubitat rewrite draft
+# Evohome Hubitat Integration
 
 **Author:** Tobey Ljungberg  
 **Version:** 2.0.0  
 **License:** Apache License 2.0 (see [LICENSE](LICENSE))
 
-This is a clean draft implementation, separate from the existing GitHub integration.
+This is a new and improved Hubitat integration for Honeywell/Resideo Evohome systems. It connects heating zones, system modes and domestic hot water, with Hubitat mode synchronisation, fault notifications and native HomeKit support for heating zones.
 
 ## Files
 
-- EvoHomeConnect.groovy: parent app, API access, child creation, polling, debounce, optimistic state reconciliation, system-mode sync and DHW commands.
+- EvoHomeConnect.groovy: parent app, API access, child creation, polling, debounce, optimistic state reconciliation, system-mode synchronisation and DHW commands.
 - EvoHomeHeatingZone.groovy: per-zone thermostat. HomeKit Off writes a permanent 5 C override; Auto clears the zone override.
-- EvoHomeSystemController.groovy: Hubitat-only system-mode control device.
 - EvoHomeHotWater.groovy: Hubitat-only DHW switch, state and temperature device.
+- EvoHomeSystemController.groovy: Hubitat-only system-mode control device.
 
 The parent app can monitor API-reported active faults for the location, gateway,
 system, zones and hot water. Current faults and a readable summary are published
@@ -27,7 +27,7 @@ Clearing a fault updates the published list; a later reappearance can notify
 again. The API reports low-battery conditions, not a battery percentage. Fault
 notification delivery depends on the selected Hubitat notification devices and
 mobile app push settings. The cloud REST API does not expose live boiler relay
-or OpenTherm heat-demand telemetry, so those cannot be reported by this draft.
+or OpenTherm heat-demand telemetry, so the integration cannot report them.
 
 When configuring Hubitat's native HomeKit integration, select the heating-zone children only. Do not select the system controller or DHW child.
 
@@ -35,13 +35,7 @@ The main app's heating-only option defaults to on. With it enabled, zone child d
 
 Zone child devices expose `nextScheduledTime` and `nextScheduledSetpoint` from the downloaded weekly schedule. These show the upcoming schedule transition used by the "until next schedule change" setpoint policy.
 
-### Heat-only HomeKit export test
-
-`EvoHomeHomeKitHeatOnlyTest.groovy` is a standalone virtual device driver for testing HomeKit capability mapping. It omits the composite `Thermostat`, cooling-setpoint, and fan-mode capabilities, using separate temperature, mode, heating-setpoint, thermostat-setpoint, and operating-state capabilities instead. It advertises Heat, Auto, and Off. The first hub test showed that Hubitat classified this as a temperature sensor rather than a thermostat.
-
-`EvoHomeHomeKitThermostatNoCoolingFanTest.groovy` is the complementary probe. It declares the composite `Thermostat` capability, but does not publish cooling-setpoint or fan-state values. Add it as a user driver, create another virtual device, then try exporting it through Hubitat's native HomeKit integration. Comparing the two results will show whether HomeKit needs the composite capability alone or also requires cooling/fan state. Neither test driver sends commands to Evohome.
-
-## Review notes
+## API and operation notes
 
 The EMEA evohome API is undocumented. The app's API host setting takes an origin only, such as `https://mytotalconnectcomfort.com`, without a `/WebApi` path. Authentication sends a URL-encoded form body to match the original working app; Hubitat's asynchronous HTTP methods serialise Map bodies as JSON. Validate the authentication response, status JSON and write acknowledgements on a test installation before replacing a live integration. The API calls are asynchronous; commands update child state immediately, are coalesced during the debounce window, and schedule a later refresh.
 
@@ -55,4 +49,3 @@ For a complete command trace, set **Main app log level** to Debug in Evohome Con
 
 Access-token renewal is scheduled using the returned `expires_in`, five minutes before expiry (or 10% of the lifetime for shorter tokens, with a 30-second minimum lead). Polling also checks the renewal deadline as a fallback. A failed refresh-token grant clears that refresh token and retries with password authentication. Renewal scheduling, duplicate-auth suppression, refresh failures and fallback are included in Debug logs without logging token values.
 
-This draft has not been executed on a Hubitat hub. It is a review candidate, not a tested drop-in release.
