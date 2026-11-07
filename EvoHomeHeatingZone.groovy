@@ -7,7 +7,8 @@
  * HomeKit zone Off is a permanent 5 C setpoint; Auto clears the override.
  */
 metadata {
-    definition(name: "Evohome Heating Zone", namespace: "tljungberg", author: "Tobey Ljungberg") {
+    definition(name: "Evohome Heating Zone", namespace: "tljungberg", author: "Tobey Ljungberg",
+        singleThreaded: true) {
         capability "Actuator"
         capability "Sensor"
         capability "Refresh"
