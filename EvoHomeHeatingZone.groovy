@@ -7,7 +7,8 @@
  * HomeKit zone Off is a permanent 5 C setpoint; Auto clears the override.
  */
 metadata {
-    definition(name: "Evohome Heating Zone", namespace: "tljungberg", author: "Tobey Ljungberg") {
+    definition(name: "Evohome Heating Zone", namespace: "tljungberg", author: "Tobey Ljungberg",
+        singleThreaded: true) {
         capability "Actuator"
         capability "Sensor"
         capability "Refresh"
@@ -19,6 +20,7 @@ metadata {
         attribute "evohomeSetpointModeDescription", "string"
         attribute "evohomeUntil", "string"
         attribute "heatingOnly", "string"
+        attribute "windowContactState", "string"
         attribute "nextScheduledTime", "string"
         attribute "nextScheduledSetpoint", "number"
         attribute "thermostatSetpointStatus", "string"
@@ -42,7 +44,7 @@ metadata {
             defaultValue: "preserve"
         input name: "setpointDuration", type: "number", title: "Duration in minutes", range: "1..1440", defaultValue: 60
         input name: "prefLogLevel", type: "enum", title: "Child-device log level",
-            description: "Local level for this zone. Reset Logging in Evohome Connect sets all child devices to the parent's selected level.",
+            description: "Effective level for this zone. Reset Logging in Evohome Connect also updates this preference to match the parent app.",
             options: ["error", "warn", "info", "debug"], defaultValue: "info"
     }
 }
@@ -51,14 +53,21 @@ def installed() {
     sendEvent(name: "thermostatOperatingState", value: "idle")
     state.logLevel = settings.prefLogLevel ?: "info"
     state.lastPrefLogLevel = settings.prefLogLevel ?: "info"
+    state.parentLogLevelOverride = null
     sendEvent(name: "loggingLevel", value: state.logLevel)
+    sendEvent(name: "windowContactState", value: "Not configured")
     setHeatingOnly(true)
 }
 
 def updated() {
     String configured = settings.prefLogLevel ?: "info"
-    if (configured != (state.lastPrefLogLevel ?: configured)) state.logLevel = configured
-    if (!state.logLevel) state.logLevel = configured
+    String previousConfigured = state.lastPrefLogLevel ?: configured
+    if (configured != previousConfigured) {
+        state.parentLogLevelOverride = null
+        state.logLevel = configured
+    } else {
+        state.logLevel = state.parentLogLevelOverride ?: configured
+    }
     state.lastPrefLogLevel = configured
     sendEvent(name: "loggingLevel", value: state.logLevel)
 }
@@ -67,15 +76,27 @@ void setLogLevel(String level) {
     String selected = (level ?: "info").toLowerCase()
     if (!(selected in ["error", "warn", "info", "debug"])) selected = "info"
     state.logLevel = selected
+    state.parentLogLevelOverride = selected
+    try {
+        device.updateSetting("prefLogLevel", [value: selected, type: "enum"])
+        state.lastPrefLogLevel = selected
+        state.parentLogLevelOverride = null
+    } catch (Exception e) {
+        logMessage("error", "The effective log level is " + selected.capitalize() +
+            ", but Hubitat could not update the displayed device preference: " + e.message + ".")
+    }
     sendEvent(name: "loggingLevel", value: selected)
     logMessage("debug", "The parent app set this child device's log level to " + selected.capitalize() + ".")
 }
 
 private void logMessage(String level, String message) {
     Map rank = [error: 1, warn: 2, info: 3, debug: 4]
-    String selected = (state.logLevel ?: settings.prefLogLevel ?: "info").toLowerCase()
-    if ((rank[level] ?: 4) <= (rank[selected] ?: 3)) {
-        switch (level) {
+    String selected = (state.logLevel ?: settings.prefLogLevel ?: "info").toString().toLowerCase()
+    String category = (level ?: "debug").toString().toLowerCase()
+    if (!rank.containsKey(selected)) selected = "info"
+    if (!rank.containsKey(category)) category = "debug"
+    if (rank[category] <= rank[selected]) {
+        switch (category) {
             case "error": log.error(device.displayName + ": " + message); break
             case "warn": log.warn(device.displayName + ": " + message); break
             case "info": log.info(device.displayName + ": " + message); break
@@ -115,6 +136,27 @@ void setNextScheduledTime(String value) {
 void setNextScheduledSetpoint(Number value) {
     logMessage("debug", "Next scheduled setpoint received from parent: " + value + " C.")
     sendEvent(name: "nextScheduledSetpoint", value: value, unit: "°C")
+}
+
+void setWindowContactOpen(Boolean configured, Boolean open) {
+    state.windowContactOpen = configured == true && open == true
+    String contactState = configured == true ? (open == true ? "Open" : "Closed") : "Not configured"
+    sendEvent(name: "windowContactState", value: contactState)
+    logMessage("debug", "Window contact state received from parent; configured=" + (configured == true) +
+        ", anyOpen=" + (open == true) + ".")
+}
+
+void setWindowContactOverride(Boolean active, Number value, String thermostatMode, Boolean pending = true) {
+    state.zoneOff = thermostatMode == "off"
+    if (value != null) {
+        sendEvent(name: "heatingSetpoint", value: value, unit: "°C")
+        sendEvent(name: "thermostatSetpoint", value: value, unit: "°C")
+        if (heatingOnlyEnabled()) sendEvent(name: "coolingSetpoint", value: value, unit: "°C")
+    }
+    sendEvent(name: "thermostatMode", value: thermostatMode ?: "auto")
+    sendEvent(name: "thermostatSetpointStatus", value: pending ? "Pending" : "Current")
+    logMessage("debug", "Window-contact thermostat state updated; active=" + active +
+        ", setpoint=" + value + " C, thermostatMode=" + thermostatMode + ", pending=" + pending + ".")
 }
 
 void setSchedule(Map schedule) {
@@ -188,6 +230,20 @@ private String readableFault(String faultType) {
 void setHeatingSetpoint(BigDecimal requested) {
     logMessage("debug", "setHeatingSetpoint() received; requested=" + requested + " C, systemMode=" +
         device.currentValue("evohomeSystemMode") + ".")
+    if (state.windowContactOpen == true) {
+        logMessage("info", "A window contact for " + device.displayName +
+            " is open, so the requested temperature change was ignored while the zone is held at 5 °C.")
+        return
+    }
+    Long coolingRequestAt = state.lastHomeKitCoolingRequestAt as Long
+    BigDecimal coolingRequest = state.lastHomeKitCoolingRequest as BigDecimal
+    if (heatingOnlyEnabled() && coolingRequestAt != null && coolingRequest != null &&
+        now() - coolingRequestAt <= 2000L && requested.compareTo(coolingRequest) != 0) {
+        logMessage("debug", "Ignoring paired heating target=" + requested +
+            " C because HomeKit just supplied cooling target=" + coolingRequest +
+            " C for the same heating-only thermostat update.")
+        return
+    }
     if (systemHeatingOff()) {
         logMessage("info", "Evohome is in Heating Off, so the requested temperature change for this zone was ignored.")
         refresh()
@@ -217,6 +273,11 @@ void setThermostatMode(String mode) {
     String m = (mode ?: "").toLowerCase()
     logMessage("debug", "setThermostatMode() received; requestedMode=" + m +
         ", systemMode=" + device.currentValue("evohomeSystemMode") + ".")
+    if (state.windowContactOpen == true) {
+        logMessage("info", "A window contact for " + device.displayName +
+            " is open, so the requested thermostat mode change was ignored while the zone is held at 5 °C.")
+        return
+    }
     if (systemHeatingOff()) {
         logMessage("info", "Evohome is in Heating Off, so the requested mode change for this zone was ignored.")
         refresh()
@@ -268,19 +329,30 @@ void heat() { setThermostatMode("heat") }
 void resumeSchedule() { setThermostatMode("auto") }
 void cool() {
     logMessage("debug", "cool() received; evohome zone cooling is unsupported.")
-    logMessage("warn", "Cooling is not supported by evohome.")
+    logMessage("debug", "Ignoring a cooling-mode request because evohome controls heating only.")
 }
 void emergencyHeat() { setThermostatMode("heat") }
 void setCoolingSetpoint(BigDecimal value) {
     if (heatingOnlyEnabled()) {
-        def heat = device.currentValue("heatingSetpoint")
+        // In HomeKit Auto mode, Hubitat can emit both callbacks for one
+        // target update. The cooling callback carries the requested target;
+        // the paired heating callback can carry the old target. Remember the
+        // cooling value briefly so it wins regardless of callback order.
+        state.lastHomeKitCoolingRequest = value
+        state.lastHomeKitCoolingRequestAt = now()
         logMessage("debug", "setCoolingSetpoint() received; requested=" + value +
-            " C, ignored in heating-only mode; restoring coolingSetpoint to heatingSetpoint=" + heat + " C.")
-        if (heat != null) sendEvent(name: "coolingSetpoint", value: heat, unit: "°C")
+            " C in heating-only mode. Treating the HomeKit cooling target as the requested heating target.")
+        // Hubitat's native HomeKit integration can deliver its single
+        // temperature target through setCoolingSetpoint(), even when the
+        // thermostat is in Heat mode. Route it through the same clamp,
+        // optimistic update and debounced Evohome write as a heating target.
+        // A preceding stale setHeatingSetpoint event is coalesced by the
+        // parent's debounce, so the final HomeKit value wins.
+        setHeatingSetpoint(value)
         return
     }
     logMessage("debug", "setCoolingSetpoint() received; requested=" + value + "; evohome cooling is unsupported.")
-    logMessage("warn", "Cooling is not supported by evohome.")
+    logMessage("debug", "Ignoring the cooling setpoint because evohome controls heating only.")
 }
 void fanAuto() {
     logMessage("debug", "fanAuto() received; setting local thermostatFanMode=auto (the only supported fan mode).")
@@ -288,16 +360,16 @@ void fanAuto() {
 }
 void fanOn() {
     logMessage("debug", "fanOn() received; evohome fan control is unsupported.")
-    logMessage("warn", "Fan control is not supported by evohome.")
+    logMessage("debug", "Ignoring a fan-on request because evohome has no fan control.")
 }
 void fanCirculate() {
     logMessage("debug", "fanCirculate() received; evohome fan control is unsupported.")
-    logMessage("warn", "Fan control is not supported by evohome.")
+    logMessage("debug", "Ignoring a fan-circulation request because evohome has no fan control.")
 }
 void setThermostatFanMode(String value) {
     logMessage("debug", "setThermostatFanMode() received; requested=" + value + ".")
     if (value == "auto") fanAuto()
-    else logMessage("warn", "Fan mode " + value + " is not supported by evohome.")
+    else logMessage("debug", "Ignoring fan mode " + value + " because evohome has no fan control.")
 }
 
 private Boolean systemHeatingOff() { device.currentValue("evohomeSystemMode") == "off" }

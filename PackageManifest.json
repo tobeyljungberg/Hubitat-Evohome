@@ -1,0 +1,47 @@
+{
+  "packageName": "Evohome",
+  "version": "2.0.0",
+  "releaseNotes": "Initial release of the Evohome Hubitat integration, version 2.0.0.",
+  "minimumHEVersion": "2.3",
+  "category": "Convenience",
+  "tags": "Convenience",
+  "author": "Tobey Ljungberg",
+  "apps": [
+    {
+      "id": "6df85956-e5e2-4e67-a86f-9d0d8f03d37c",
+      "name": "Evohome Connect",
+      "namespace": "tljungberg",
+      "version": "2.0.0",
+      "location": "https://raw.githubusercontent.com/tobeyljungberg/Hubitat-Evohome/main/EvoHomeConnect.groovy",
+      "required": true,
+      "oauth": false,
+      "primary": true
+    }
+  ],
+  "drivers": [
+    {
+      "id": "6ee69a80-f4af-41fd-b70f-ad74dfec22a8",
+      "name": "Evohome Heating Zone",
+      "namespace": "tljungberg",
+      "version": "2.0.0",
+      "location": "https://raw.githubusercontent.com/tobeyljungberg/Hubitat-Evohome/main/EvoHomeHeatingZone.groovy",
+      "required": true
+    },
+    {
+      "id": "fd5be135-3e6c-44d3-99e4-a5404d3b86b5",
+      "name": "Evohome Hot Water",
+      "namespace": "tljungberg",
+      "version": "2.0.0",
+      "location": "https://raw.githubusercontent.com/tobeyljungberg/Hubitat-Evohome/main/EvoHomeHotWater.groovy",
+      "required": true
+    },
+    {
+      "id": "5c473926-a378-4e7f-823b-4158e53dd198",
+      "name": "Evohome System Controller",
+      "namespace": "tljungberg",
+      "version": "2.0.0",
+      "location": "https://raw.githubusercontent.com/tobeyljungberg/Hubitat-Evohome/main/EvoHomeSystemController.groovy",
+      "required": true
+    }
+  ]
+}
