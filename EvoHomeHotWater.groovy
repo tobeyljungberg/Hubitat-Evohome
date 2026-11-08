@@ -27,7 +27,7 @@ metadata {
     }
     preferences {
         input name: "prefLogLevel", type: "enum", title: "Child-device log level",
-            description: "Local level for this child. Reset Logging in Evohome Connect sets all child devices to the parent's selected level.",
+            description: "Effective level for this child. Reset Logging in Evohome Connect also updates this preference to match the parent app.",
             options: ["error", "warn", "info", "debug"], defaultValue: "info"
     }
 }
@@ -35,12 +35,18 @@ metadata {
 def installed() {
     state.logLevel = settings.prefLogLevel ?: "info"
     state.lastPrefLogLevel = settings.prefLogLevel ?: "info"
+    state.parentLogLevelOverride = null
     sendEvent(name: "loggingLevel", value: state.logLevel)
 }
 def updated() {
     String configured = settings.prefLogLevel ?: "info"
-    if (configured != (state.lastPrefLogLevel ?: configured)) state.logLevel = configured
-    if (!state.logLevel) state.logLevel = configured
+    String previousConfigured = state.lastPrefLogLevel ?: configured
+    if (configured != previousConfigured) {
+        state.parentLogLevelOverride = null
+        state.logLevel = configured
+    } else {
+        state.logLevel = state.parentLogLevelOverride ?: configured
+    }
     state.lastPrefLogLevel = configured
     sendEvent(name: "loggingLevel", value: state.logLevel)
 }
@@ -49,15 +55,27 @@ void setLogLevel(String level) {
     String selected = (level ?: "info").toLowerCase()
     if (!(selected in ["error", "warn", "info", "debug"])) selected = "info"
     state.logLevel = selected
+    state.parentLogLevelOverride = selected
+    try {
+        device.updateSetting("prefLogLevel", [value: selected, type: "enum"])
+        state.lastPrefLogLevel = selected
+        state.parentLogLevelOverride = null
+    } catch (Exception e) {
+        logMessage("error", "The effective log level is " + selected.capitalize() +
+            ", but Hubitat could not update the displayed device preference: " + e.message + ".")
+    }
     sendEvent(name: "loggingLevel", value: selected)
     logMessage("debug", "The parent app set this child device's log level to " + selected.capitalize() + ".")
 }
 
 private void logMessage(String level, String message) {
     Map rank = [error: 1, warn: 2, info: 3, debug: 4]
-    String selected = (state.logLevel ?: settings.prefLogLevel ?: "info").toLowerCase()
-    if ((rank[level] ?: 4) <= (rank[selected] ?: 3)) {
-        switch (level) {
+    String selected = (state.logLevel ?: settings.prefLogLevel ?: "info").toString().toLowerCase()
+    String category = (level ?: "debug").toString().toLowerCase()
+    if (!rank.containsKey(selected)) selected = "info"
+    if (!rank.containsKey(category)) category = "debug"
+    if (rank[category] <= rank[selected]) {
+        switch (category) {
             case "error": log.error(device.displayName + ": " + message); break
             case "warn": log.warn(device.displayName + ": " + message); break
             case "info": log.info(device.displayName + ": " + message); break
@@ -73,12 +91,12 @@ void refresh() {
 
 void on() {
     logMessage("debug", "on() received; requesting hot water On.")
-    logMessage("info", "Hot water was turned on. Sending the command to Evohome.")
+    logMessage("info", "Hubitat requested hot water On. Sending the command to Evohome.")
     setState("on")
 }
 void off() {
     logMessage("debug", "off() received; requesting hot water Off.")
-    logMessage("info", "Hot water was turned off. Sending the command to Evohome.")
+    logMessage("info", "Hubitat requested hot water Off. Sending the command to Evohome.")
     setState("off")
 }
 void auto() {
@@ -88,12 +106,12 @@ void auto() {
 }
 void onFor(Number minutes) {
     logMessage("debug", "onFor() received; duration=" + minutes + " minute(s).")
-    logMessage("info", "Hot water was turned on for " + minutes + " minute(s). Sending the timed command to Evohome.")
+    logMessage("info", "Hubitat requested hot water On for " + minutes + " minute(s). Sending the timed command to Evohome.")
     parent.setDhw(device.getDataValue("dhwId"), "on", minutes)
 }
 void offFor(Number minutes) {
     logMessage("debug", "offFor() received; duration=" + minutes + " minute(s).")
-    logMessage("info", "Hot water was turned off for " + minutes + " minute(s). Sending the timed command to Evohome.")
+    logMessage("info", "Hubitat requested hot water Off for " + minutes + " minute(s). Sending the timed command to Evohome.")
     parent.setDhw(device.getDataValue("dhwId"), "off", minutes)
 }
 private void setState(String value) {
