@@ -1,6 +1,6 @@
 /**
  * Evohome System Controller driver for Hubitat
- * Author: Tobey Ljungberg | Version: 2.0.0 | Copyright (c) 2026 Tobey Ljungberg
+ * Author: Tobey Ljungberg | Version: 2.0.1 | Copyright (c) 2026 Tobey Ljungberg
  * SPDX-License-Identifier: Apache-2.0
  * Licensed under Apache License, Version 2.0. You may use, modify and redistribute
  * this work under those terms. https://www.apache.org/licenses/LICENSE-2.0

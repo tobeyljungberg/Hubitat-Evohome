@@ -1,7 +1,7 @@
 # Evohome Hubitat Integration
 
 **Author:** Tobey Ljungberg  
-**Version:** 2.0.0  
+**Version:** 2.0.1
 **License:** Apache License 2.0 (see [LICENSE](LICENSE))
 
 This is a new and improved Hubitat integration for Honeywell/Resideo Evohome systems. It connects heating zones, system modes and domestic hot water, with Hubitat mode synchronisation, fault notifications and native HomeKit support for heating zones.
