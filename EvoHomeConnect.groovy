@@ -34,6 +34,8 @@ preferences {
             input "settleSeconds", "number", title: "Check Evohome after a command (seconds)",
                 description: "How long to wait before polling after a command, giving Evohome time to apply it. The child device updates immediately, then is corrected if Evohome reports a different value.",
                 range: "2..60", defaultValue: 8, required: true
+            href name: "zoneSetpointSetup", page: "zoneSetpointPage", title: "Configure setpoint behaviour by zone",
+                description: "Choose separately for each zone how temperature overrides should expire."
         }
         section("Heating-only system compatibility") {
             paragraph "Evohome zones control heating, not cooling or a fan. In HomeKit, export the heating-zone child devices only. Hubitat's native HomeKit integration may still show cooling and fan controls because it exports the complete Thermostat capability."
@@ -84,6 +86,39 @@ preferences {
     }
     page(name: "windowContactPage", title: "Window contacts by zone", install: false, uninstall: false)
     page(name: "awayOverridePage", title: "Away override preservation by zone", install: false, uninstall: false)
+    page(name: "zoneSetpointPage", title: "Setpoint behaviour by zone", install: false, uninstall: false)
+}
+
+def zoneSetpointPage(params) {
+    List zones = windowContactZoneRows()
+    dynamicPage(name: "zoneSetpointPage", title: "Setpoint behaviour by zone", install: false, uninstall: false) {
+        if (!zones) {
+            section("Zones not available yet") {
+                paragraph "Evohome zone details are loaded during the first installation sync. Save and install the app, wait for its first successful sync and for the zone child devices to appear, then reopen this page."
+            }
+        } else {
+            section("Choose how each zone's setpoint changes expire") {
+                paragraph "These settings are per zone and are managed here in the parent app. They apply to temperature changes and Heat-mode requests from Hubitat or HomeKit. Off remains a permanent 5 °C override, and Auto clears the zone override."
+            }
+            zones.each { zone ->
+                section(zone.locationName + " / " + zone.zoneName) {
+                    String policySetting = "zoneSetpointPolicy_" + zone.zoneId
+                    String durationSetting = "zoneSetpointDuration_" + zone.zoneId
+                    input(name: policySetting, type: "enum", title: "Setpoint change behaviour",
+                        description: "Preserve keeps an existing override's expiry or permanence; if this zone follows its schedule, the new override lasts until the next schedule point.",
+                        options: ["preserve": "Preserve existing override; otherwise until next schedule change",
+                                  "next": "Until next schedule change", "permanent": "Permanent override",
+                                  "duration": "For a fixed duration"],
+                        defaultValue: "preserve", required: true)
+                    if ((settings[policySetting] ?: "preserve") == "duration") {
+                        input(name: durationSetting, type: "number", title: "Override duration (minutes)",
+                            description: "Used when this zone's setpoint change behaviour is For a fixed duration.",
+                            range: "1..1440", defaultValue: 60, required: true)
+                    }
+                }
+            }
+        }
+    }
 }
 
 def windowContactPage(params) {
@@ -295,6 +330,18 @@ private void logMessage(String level, String message) {
             default: log.debug "Evohome Connect: " + message
         }
     }
+}
+
+String zoneSetpointPolicy(String zoneId) {
+    String policySetting = "zoneSetpointPolicy_" + zoneId
+    String policy = (settings[policySetting] ?: "preserve").toString()
+    if (policy == "duration") {
+        def configuredMinutes = settings["zoneSetpointDuration_" + zoneId]
+        Integer minutes = configuredMinutes != null ? (configuredMinutes as Integer) : 60
+        minutes = Math.max(1, Math.min(1440, minutes))
+        return "duration:" + minutes
+    }
+    policy in ["preserve", "next", "permanent"] ? policy : "preserve"
 }
 
 def start() {

@@ -37,12 +37,6 @@ metadata {
         command "setSchedule", ["JSON_OBJECT"]
     }
     preferences {
-        input name: "setpointPolicy", type: "enum", title: "Setpoint change behaviour",
-            options: ["preserve": "Preserve an existing override; otherwise until next schedule change",
-                      "next": "Until next schedule change", "permanent": "Permanent override",
-                      "duration": "For a fixed duration"],
-            defaultValue: "preserve"
-        input name: "setpointDuration", type: "number", title: "Duration in minutes", range: "1..1440", defaultValue: 60
         input name: "prefLogLevel", type: "enum", title: "Child-device log level",
             description: "Effective level for this zone. Reset Logging in Evohome Connect also updates this preference to match the parent app.",
             options: ["error", "warn", "info", "debug"], defaultValue: "info"
@@ -260,8 +254,7 @@ void setHeatingSetpoint(BigDecimal requested) {
     if (heatingOnlyEnabled()) sendEvent(name: "coolingSetpoint", value: value, unit: "°C")
     sendEvent(name: "thermostatMode", value: "heat")
     sendEvent(name: "thermostatSetpointStatus", value: "Pending")
-    String policy = settings.setpointPolicy ?: "preserve"
-    if (policy == "duration") policy = "duration:" + (settings.setpointDuration ?: 60)
+    String policy = parent.zoneSetpointPolicy(device.getDataValue("zoneId").toString())
     logMessage("debug", "Optimistic thermostat update sent; clampedSetpoint=" + value +
         " C, policy=" + policy + ". Forwarding setpoint request to parent.")
     parent.requestZoneSetpoint(device.deviceNetworkId, value, policy)
@@ -308,8 +301,7 @@ void setThermostatMode(String mode) {
             refresh()
             return
         }
-        String policy = settings.setpointPolicy ?: "preserve"
-        if (policy == "duration") policy = "duration:" + (settings.setpointDuration ?: 60)
+        String policy = parent.zoneSetpointPolicy(device.getDataValue("zoneId").toString())
         logMessage("info", "" + device.displayName + " was set to Heat. Applying an override at " + currentTarget + " °C in Evohome.")
         logMessage("debug", "Mapping zone Heat to an override at the current target=" + currentTarget +
             " C, policy=" + policy + ".")
