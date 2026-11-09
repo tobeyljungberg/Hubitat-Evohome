@@ -1,7 +1,7 @@
 /**
  * Evohome Connect for Hubitat
  * Author: Tobey Ljungberg
- * Version: 2.0.0
+ * Version: 2.0.1
  * Copyright (c) 2026 Tobey Ljungberg
  * SPDX-License-Identifier: Apache-2.0
  * Licensed under the Apache License, Version 2.0. You may use, modify and
@@ -319,7 +319,9 @@ def poll() {
         return
     }
     (state.locations ?: []).each { getLocation(it.toString(), "poll") }
-    if (!state.scheduleUpdatedAt || now() - (state.scheduleUpdatedAt as Long) > 3600000L) refreshSchedules()
+    refreshNextScheduledTimes()
+    if (state.zoneSchedules == null || !state.scheduleUpdatedAt ||
+        now() - (state.scheduleUpdatedAt as Long) > 3600000L) refreshSchedules()
 }
 
 void renewToken() {
@@ -646,6 +648,7 @@ private String sdni(String id) { "Evohome-S-" + id }
 private String hdni(String id) { "Evohome-H-" + id }
 
 private void refreshSchedules() {
+    state.zoneSchedules = state.zoneSchedules ?: [:]
     (state.installation ?: []).each { loc ->
         (loc.gateways ?: []).each { gw ->
             (gw.temperatureControlSystems ?: []).each { sys ->
@@ -681,18 +684,31 @@ private void acceptSchedule(def schedule, String zoneId) {
             ", dayCount=" + dailySchedules.size() + ".")
         return
     }
-    TimeZone tz = location.timeZone ?: TimeZone.getTimeZone("Europe/London")
+    Map schedules = state.zoneSchedules ?: [:]
+    schedules[zoneId] = entries.collect { [day: it.day.toString(), time: it.time.toString(), temperature: it.temperature] }
+    state.zoneSchedules = schedules
+    updateNextScheduledTime(zoneId)
+}
+
+private void refreshNextScheduledTimes() {
+    Map schedules = state.zoneSchedules ?: [:]
+    schedules.keySet().each { zoneId -> updateNextScheduledTime(zoneId.toString()) }
+}
+
+private Map calculateNextSchedulePoint(List entries, TimeZone tz, long referenceTime) {
     Calendar nowCal = Calendar.getInstance(tz)
+    nowCal.setTimeInMillis(referenceTime)
     Calendar candidate = null
     Map candidatePoint = null
     Map dayNumbers = [sunday: Calendar.SUNDAY, monday: Calendar.MONDAY, tuesday: Calendar.TUESDAY,
                       wednesday: Calendar.WEDNESDAY, thursday: Calendar.THURSDAY, friday: Calendar.FRIDAY, saturday: Calendar.SATURDAY]
     entries.each { point ->
-        Integer targetDay = dayNumbers[point.day.toLowerCase()]
+        Integer targetDay = dayNumbers[point.day?.toString()?.toLowerCase()]
         if (!targetDay) return
-        String[] parts = point.time.split(":")
-        if (parts.length < 2) return
+        String[] parts = point.time?.toString()?.split(":")
+        if (!parts || parts.length < 2) return
         Calendar c = Calendar.getInstance(tz)
+        c.setTimeInMillis(referenceTime)
         c.set(Calendar.HOUR_OF_DAY, parts[0] as Integer)
         c.set(Calendar.MINUTE, parts[1] as Integer)
         c.set(Calendar.SECOND, 0)
@@ -705,14 +721,22 @@ private void acceptSchedule(def schedule, String zoneId) {
             candidatePoint = point
         }
     }
-    if (candidate) {
-        def child = getChildDevice(zdni(zoneId))
-        String nextTime = candidate.getTime().format("yyyy-MM-dd'T'HH:mm:ssXXX", tz)
-        child?.setNextScheduledTime(nextTime)
-        if (candidatePoint?.temperature != null) child?.setNextScheduledSetpoint(candidatePoint.temperature as BigDecimal)
-        logMessage("debug", "Next schedule point imported; zoneId=" + zoneId + ", time=" + nextTime +
-            ", setpoint=" + (candidatePoint?.temperature ?: "not supplied") + " C.")
-    }
+    if (!candidate) return null
+    [time: candidate.getTime().format("yyyy-MM-dd'T'HH:mm:ssXXX", tz), temperature: candidatePoint?.temperature]
+}
+
+private Map updateNextScheduledTime(String zoneId, long referenceTime = now()) {
+    List entries = (state.zoneSchedules ?: [:])[zoneId] as List
+    if (!entries) return null
+    TimeZone tz = location.timeZone ?: TimeZone.getTimeZone("Europe/London")
+    Map nextPoint = calculateNextSchedulePoint(entries, tz, referenceTime)
+    if (!nextPoint) return null
+    def child = getChildDevice(zdni(zoneId))
+    child?.setNextScheduledTime(nextPoint.time.toString())
+    if (nextPoint.temperature != null) child?.setNextScheduledSetpoint(nextPoint.temperature as BigDecimal)
+    logMessage("debug", "Next schedule point calculated from the current time; zoneId=" + zoneId +
+        ", time=" + nextPoint.time + ", setpoint=" + (nextPoint.temperature ?: "not supplied") + " C.")
+    nextPoint
 }
 
 private void getLocation(String id, String reason, Map extra = [:]) {
@@ -1138,11 +1162,28 @@ private void writePendingZone(Map meta, Map fresh) {
         until = sp.until ?: sp.timeUntil
     } else {
         mode = policy == "permanent" ? 1 : 2
-        until = getChildDevice(zdni(zid))?.currentValue("nextScheduledTime")
+        Map nextPoint = updateNextScheduledTime(zid)
+        until = nextPoint?.time
+        if (!until) {
+            def storedUntil = getChildDevice(zdni(zid))?.currentValue("nextScheduledTime")
+            Date storedDate = storedUntil ? parseIsoTimestamp(storedUntil.toString()) : null
+            if (storedDate && storedDate.time > now()) until = storedUntil
+        }
         if (!until && policy == "preserve" && (sp.until || sp.timeUntil)) until = sp.until ?: sp.timeUntil
         if (!until && mode == 2) {
             logMessage("warn", "No next scheduled change is known for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
                 ". The temporary setpoint request was cancelled.")
+            state.pending.remove(zid)
+            getChildDevice(p.dni)?.refresh()
+            return
+        }
+    }
+    if (mode == 2) {
+        Date expiryDate = until ? parseIsoTimestamp(until.toString()) : null
+        if (!expiryDate || expiryDate.time <= now()) {
+            logMessage("warn", "The temporary override expiry for " +
+                (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
+                " is missing, invalid, or already past. The request was cancelled instead of sending an unusable expiry.")
             state.pending.remove(zid)
             getChildDevice(p.dni)?.refresh()
             return
@@ -1338,6 +1379,21 @@ private void restoreAwayZoneOverrides(String sid, Map systemStatus, String mode)
         }
     }
     state.awayZoneSnapshots.remove(sid)
+}
+
+private Date parseIsoTimestamp(String value) {
+    if (!value) return null
+    for (String pattern : ["yyyy-MM-dd'T'HH:mm:ss.SSSXXX", "yyyy-MM-dd'T'HH:mm:ssXXX",
+                           "yyyy-MM-dd'T'HH:mm:ss.SSSXX", "yyyy-MM-dd'T'HH:mm:ssXX",
+                           "yyyy-MM-dd'T'HH:mm:ss'Z'"]) {
+        try {
+            java.text.SimpleDateFormat format = new java.text.SimpleDateFormat(pattern)
+            format.setLenient(false)
+            format.setTimeZone(TimeZone.getTimeZone("UTC"))
+            return format.parse(value)
+        } catch (Exception ignored) { }
+    }
+    null
 }
 
 private Date parseDate(String value) {
