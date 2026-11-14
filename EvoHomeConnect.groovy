@@ -9,7 +9,8 @@
  * The EMEA TCC API used here is an undocumented vendor API.
  */
 definition(name: "Evohome Connect", namespace: "tljungberg", author: "Tobey Ljungberg",
-    description: "Connect evohome heating, system modes and DHW to Hubitat.", category: "Convenience", singleInstance: true)
+    description: "Connect evohome heating, system modes and DHW to Hubitat.", category: "Convenience",
+    singleInstance: true, singleThreaded: true)
 
 preferences {
     page(name: "mainPage", title: "Evohome Connect", install: true, uninstall: true) {
@@ -203,8 +204,7 @@ private Boolean updateWindowZoneState(String zoneId, List contacts = null) {
         openStates.remove(zoneId)
     }
     if (!configured && !anyOpen && !snapshots[zoneId] && pending[zoneId]?.action == "windowOpen") {
-        pending.remove(zoneId)
-        state.pending = pending
+        clearPendingZoneRequest(zoneId, pending[zoneId]?.version)
     }
     def child = getChildDevice(zdni(zoneId))
     child?.setWindowContactOpen(configured, anyOpen)
@@ -258,6 +258,7 @@ private void initialize() {
     unsubscribe()
     state.root = (settings.apiHost ?: "https://mytotalconnectcomfort.com").trim().replaceAll('/+$', '')
     state.pending = state.pending ?: [:]
+    state.zoneRequestVersions = state.zoneRequestVersions ?: [:]
     state.modeSnapshots = state.modeSnapshots ?: [:]
     state.awayZoneSnapshots = state.awayZoneSnapshots ?: [:]
     state.modeSyncOwned = state.modeSyncOwned ?: [:]
@@ -269,6 +270,7 @@ private void initialize() {
     state.windowRestoreInFlight = state.windowRestoreInFlight ?: [:]
     state.windowSensorZones = state.windowSensorZones ?: [:]
     state.requestCounter = state.requestCounter ?: 0
+    recoverPendingZoneRequests()
     Boolean heatingOnly = settings.heatingOnly != false
     logMessage("debug", "Initialising; API host=" + state.root + ", poll=" + (settings.pollMinutes ?: 5) +
         "m, debounce=" + (settings.debounceSeconds ?: 3) + "s, settle=" + (settings.settleSeconds ?: 8) +
@@ -512,8 +514,9 @@ void apiResponse(resp, Map meta) {
             runIn(2, "start", [overwrite: true])
         }
         if (action == "zoneBeforeWrite") {
-            state.pending?.remove(meta.zoneId?.toString())
-            getChildDevice(zdni(meta.zoneId?.toString()))?.refresh()
+            failPendingZonePreflight(meta, "HTTP " + (resp?.status ?: "transport error"))
+        } else if (action == "location" && meta?.reason?.toString() == "zonePreflight") {
+            failPendingZonePreflight(meta, "HTTP " + (resp?.status ?: "transport error"))
         } else if (action in ["zoneWrite", "zoneClear", "systemWrite", "dhwWrite"]) {
             if (action in ["zoneWrite", "zoneClear"]) handleWindowWriteResponse(meta, false)
             runIn(5, "poll", [overwrite: true])
@@ -529,6 +532,11 @@ void apiResponse(resp, Map meta) {
             ", Content-Type: " + responseType
         if (locationEntry?.value) detail += ", redirect: " + locationEntry.value
         logMessage("error", detail)
+        if (action == "zoneBeforeWrite") {
+            failPendingZonePreflight(meta, "non-JSON response")
+        } else if (action == "location" && meta?.reason?.toString() == "zonePreflight") {
+            failPendingZonePreflight(meta, "non-JSON response")
+        }
         if (action in ["zoneWrite", "zoneClear"] && meta?.windowAction) handleWindowWriteResponse(meta, false)
         if (action == "auth" && meta?.grant == "refresh_token") {
             fallbackToPasswordAuth("non-JSON authentication response")
@@ -745,12 +753,16 @@ private void getLocation(String id, String reason, Map extra = [:]) {
 }
 
 private void acceptLocation(def payload, String locationId, String reason, Map meta = [:]) {
-    if (!(payload instanceof Map)) return
+    if (!(payload instanceof Map)) {
+        if (reason == "zonePreflight") failPendingZonePreflight(meta, "location response was not an object")
+        return
+    }
     logMessage("debug", "Processing location status; locationId=" + locationId + ", reason=" + reason +
         ", gateways=" + (payload.gateways ?: []).size() + ".")
     state.lastStatus = state.lastStatus ?: [:]
     state.lastStatus[locationId] = payload
     processFaults("location", locationId, payload.locationName ?: "Evohome location", payload.activeFaults)
+    Boolean preflightZoneFound = false
     (payload.gateways ?: []).each { gw ->
         processFaults("gateway", gw.gatewayId?.toString(), "Evohome gateway", gw.activeFaults)
         (gw.temperatureControlSystems ?: []).each { sys ->
@@ -774,20 +786,29 @@ private void acceptLocation(def payload, String locationId, String reason, Map m
                 hot?.parseDhwStatus(sys.dhw as Map)
             }
             if (reason == "zonePreflight" && (sys.zones ?: []).any { it.zoneId.toString() == meta.zoneId?.toString() }) {
-                preflightZoneWrite(meta.zoneId.toString(), mode)
+                preflightZoneFound = true
+                preflightZoneWrite(meta.zoneId.toString(), mode, meta.version)
             }
             if (reason == "syncEnter") syncEnter(sid, mode, ms, sys)
             if (reason == "syncLeave") syncLeave(sid, mode)
             if (reason == "syncRestore" && meta.systemId?.toString() == sid) restoreAwayZoneOverrides(sid, sys, mode)
         }
     }
+    if (reason == "zonePreflight" && !preflightZoneFound) {
+        failPendingZonePreflight(meta, "zone was absent from the location response")
+    }
 }
 
-private void preflightZoneWrite(String zid, String mode) {
+private void preflightZoneWrite(String zid, String mode, def version) {
     Map pending = (state.pending ?: [:])[zid]
     if (!pending) return
+    if (version == null || pending.version?.toString() != version.toString()) {
+        logMessage("debug", "Ignoring stale location preflight for zone " + zid + "; response version=" + version +
+            ", current version=" + pending.version + ".")
+        return
+    }
     if (mode == "off") {
-        state.pending.remove(zid)
+        clearPendingZoneRequest(zid, pending.version)
         String zoneLabel = getChildDevice(pending.dni)?.displayName ?: ("zone " + zid)
         if (pending.action in ["windowOpen", "windowRestore"]) {
             logMessage("info", "Evohome is in Heating Off, so the window contact action for " + zoneLabel + " is deferred until the system leaves Off.")
@@ -797,8 +818,14 @@ private void preflightZoneWrite(String zid, String mode) {
         }
         return
     }
-    apiGet("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/status", "zoneBeforeWrite",
-        [zoneId: zid, version: pending.version])
+    Map current = beginPendingZoneStage(zid, pending.version, "zonePreflight")
+    if (!current) return
+    try {
+        apiGet("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/status", "zoneBeforeWrite",
+            [zoneId: zid, version: current.version])
+    } catch (Exception e) {
+        failPendingZonePreflight([zoneId: zid, version: current.version], "request could not be queued: " + e.message)
+    }
 }
 
 private void publishZone(Map z, String zid, String systemMode = null) {
@@ -908,7 +935,7 @@ private void reconcileWindowOverride(String zid, String systemMode) {
     }
     if (!snapshots[zid]) {
         if (pending?.action == "windowOpen") {
-            (state.pending ?: [:]).remove(zid)
+            clearPendingZoneRequest(zid, pending.version)
             logMessage("debug", "Cancelled the pending window-open override for zone " + zid + " because all contacts closed before the override was applied.")
         }
         return
@@ -922,15 +949,152 @@ private void reconcileWindowOverride(String zid, String systemMode) {
     }
 }
 
+private Integer zonePreflightTimeoutSeconds() { 40 }
+
+private Integer nextZoneRequestVersion(String zid, Map pending = null) {
+    Map versions = new LinkedHashMap(state.zoneRequestVersions ?: [:])
+    Map currentPending = pending != null ? pending[zid] as Map : (state.pending ?: [:])[zid] as Map
+    Integer lastVersion = (versions[zid] ?: 0) as Integer
+    Integer pendingVersion = (currentPending?.version ?: 0) as Integer
+    Integer nextVersion = Math.max(lastVersion, pendingVersion) + 1
+    versions[zid] = nextVersion
+    state.zoneRequestVersions = versions
+    nextVersion
+}
+
+private void scheduleZoneFlush(String zid, Integer version, Integer delaySeconds) {
+    runIn(Math.max(1, delaySeconds ?: 1), "flushZone",
+        [data: [zoneId: zid, version: version], overwrite: false])
+}
+
+private Map beginPendingZoneStage(String zid, def version, String phase) {
+    Map pending = new LinkedHashMap(state.pending ?: [:])
+    Map current = pending[zid] instanceof Map ? new LinkedHashMap(pending[zid] as Map) : null
+    if (!current || version == null || current.version?.toString() != version.toString()) return null
+    current.phase = phase
+    current.stageStartedAt = now()
+    pending[zid] = current
+    state.pending = pending
+    schedulePendingZoneWatchdog()
+    current
+}
+
+private Map clearPendingZoneRequest(String zid, def expectedVersion = null) {
+    Map pending = new LinkedHashMap(state.pending ?: [:])
+    Map current = pending[zid] instanceof Map ? pending[zid] as Map : null
+    if (!current) return null
+    if (expectedVersion != null && current.version?.toString() != expectedVersion.toString()) return null
+    pending.remove(zid)
+    state.pending = pending
+    schedulePendingZoneWatchdog()
+    current
+}
+
+private void failPendingZonePreflight(Map meta, String reason) {
+    String zid = meta?.zoneId?.toString()
+    if (!zid || meta?.version == null) {
+        logMessage("debug", "Ignoring zone preflight failure without a zone ID and request version; reason=" + reason + ".")
+        return
+    }
+    Map cleared = clearPendingZoneRequest(zid, meta.version)
+    if (!cleared) {
+        logMessage("debug", "Ignoring failed zone preflight for zone " + zid +
+            " because its pending request has already changed or cleared; reason=" + reason + ".")
+        return
+    }
+    logMessage("warn", "The preflight request for zone " + zid + " did not complete (" + reason +
+        "). The pending Hubitat change was cancelled and Evohome status will be refreshed.")
+    getChildDevice(cleared.dni ?: zdni(zid))?.refresh()
+}
+
+private void schedulePendingZoneWatchdog() {
+    Long earliestDeadline = null
+    (state.pending ?: [:]).each { zid, item ->
+        if (item instanceof Map && item.phase in ["locationPreflight", "zonePreflight"] && item.stageStartedAt) {
+            Long deadline = (item.stageStartedAt as Long) + zonePreflightTimeoutSeconds() * 1000L
+            if (earliestDeadline == null || deadline < earliestDeadline) earliestDeadline = deadline
+        }
+    }
+    unschedule("checkPendingZoneRequests")
+    if (earliestDeadline != null) {
+        Integer delay = Math.max(1, Math.ceil((earliestDeadline - now()) / 1000.0d) as Integer)
+        runIn(delay, "checkPendingZoneRequests", [overwrite: true])
+    }
+}
+
+void checkPendingZoneRequests() {
+    Long currentTime = now()
+    List expired = []
+    (state.pending ?: [:]).each { zid, item ->
+        if (item instanceof Map && item.phase in ["locationPreflight", "zonePreflight"] && item.stageStartedAt) {
+            Long deadline = (item.stageStartedAt as Long) + zonePreflightTimeoutSeconds() * 1000L
+            if (deadline <= currentTime) expired << [zoneId: zid.toString(), version: item.version, phase: item.phase]
+        }
+    }
+    expired.each { request ->
+        Map cleared = clearPendingZoneRequest(request.zoneId, request.version)
+        if (cleared) {
+            logMessage("warn", "The " + request.phase + " request for zone " + request.zoneId +
+                " exceeded " + zonePreflightTimeoutSeconds() + " seconds. Its pending state was cleared; refreshing Evohome status.")
+            getChildDevice(cleared.dni ?: zdni(request.zoneId))?.refresh()
+        }
+    }
+    schedulePendingZoneWatchdog()
+}
+
+private void recoverPendingZoneRequests() {
+    Map pending = new LinkedHashMap(state.pending ?: [:])
+    Map versions = new LinkedHashMap(state.zoneRequestVersions ?: [:])
+    Long currentTime = now()
+    List toRefresh = []
+    List toRemove = []
+    pending.each { zidValue, itemValue ->
+        String zid = zidValue.toString()
+        Map item = itemValue instanceof Map ? itemValue as Map : [:]
+        Integer lastVersion = (versions[zid] ?: 0) as Integer
+        Integer pendingVersion = (item.version ?: 0) as Integer
+        if (pendingVersion > lastVersion) versions[zid] = pendingVersion
+        Boolean valid = item.version != null && item.action != null
+        if (!valid) {
+            toRemove << zidValue
+            toRefresh << zid
+        } else if (item.phase == "debounce" && item.debounceUntil) {
+            Long due = item.debounceUntil as Long
+            Integer delay = Math.max(1, Math.ceil((due - currentTime) / 1000.0d) as Integer)
+            scheduleZoneFlush(zid, item.version as Integer, delay)
+        } else if (item.phase in ["locationPreflight", "zonePreflight"] && item.stageStartedAt) {
+            Long deadline = (item.stageStartedAt as Long) + zonePreflightTimeoutSeconds() * 1000L
+            if (deadline <= currentTime) {
+                toRemove << zidValue
+                toRefresh << zid
+            }
+        } else {
+            toRemove << zidValue
+            toRefresh << zid
+        }
+    }
+    toRemove.each { pending.remove(it) }
+    state.pending = pending
+    state.zoneRequestVersions = versions
+    toRefresh.unique().each { zid ->
+        logMessage("warn", "Cleared an abandoned pending request for zone " + zid +
+            " during app startup. The normal installation status sync will reconcile the child device.")
+    }
+    schedulePendingZoneWatchdog()
+}
+
 private void queueWindowAction(String zid, String action) {
     Map pending = state.pending ?: [:]
     Map previous = pending[zid] ?: [version: 0]
     if (previous.action == action) return
     String dni = zdni(zid)
-    pending[zid] = [zoneId: zid, dni: dni, action: action, version: (previous.version as Integer) + 1]
+    Integer version = nextZoneRequestVersion(zid, pending)
+    Long requestedAt = now()
+    pending[zid] = [zoneId: zid, dni: dni, action: action, version: version,
+        createdAt: requestedAt, phase: "debounce", debounceUntil: requestedAt + 1000L]
     state.pending = pending
-    logMessage("debug", "Queued window contact action for zone " + zid + "; action=" + action + ", version=" + pending[zid].version + ".")
-    runIn(1, "flushZone", [data: [zoneId: zid], overwrite: true])
+    logMessage("debug", "Queued window contact action for zone " + zid + "; action=" + action + ", version=" + version + ".")
+    scheduleZoneFlush(zid, version, 1)
 }
 
 private Long parseWindowExpiry(def value) {
@@ -991,10 +1155,13 @@ void requestZoneSetpoint(String dni, BigDecimal value, String policy) {
     logMessage("debug", "Child request received: zone setpoint; zoneId=" + zid + ", requested=" + value +
         " C, policy=" + (policy ?: "preserve") + ", debounce=" + (settings.debounceSeconds ?: 3) + "s.")
     Map pending = state.pending ?: [:]
-    Map old = pending[zid] ?: [version: 0]
-    pending[zid] = [zoneId: zid, dni: dni, value: value, policy: policy ?: "preserve", action: "set", version: (old.version as Integer) + 1]
+    Integer version = nextZoneRequestVersion(zid, pending)
+    Long requestedAt = now()
+    Integer debounce = Math.max(1, (settings.debounceSeconds ?: 3) as Integer)
+    pending[zid] = [zoneId: zid, dni: dni, value: value, policy: policy ?: "preserve", action: "set",
+        version: version, createdAt: requestedAt, phase: "debounce", debounceUntil: requestedAt + debounce * 1000L]
     state.pending = pending
-    runIn(Math.max(1, (settings.debounceSeconds ?: 3) as Integer), "flushZone", [data: [zoneId: zid], overwrite: true])
+    scheduleZoneFlush(zid, version, debounce)
 }
 
 void setZoneOff(String dni) { requestZoneSetpoint(dni, 5.0G, "permanent") }
@@ -1007,27 +1174,51 @@ void clearZone(String dni) {
         ". Clearing its override in Evohome.")
     logMessage("debug", "Child request received: clear zone override; zoneId=" + zid + ".")
     Map pending = state.pending ?: [:]
-    Map old = pending[zid] ?: [version: 0]
-    pending[zid] = [zoneId: zid, dni: dni, action: "clear", version: (old.version as Integer) + 1]
+    Integer version = nextZoneRequestVersion(zid, pending)
+    Long requestedAt = now()
+    pending[zid] = [zoneId: zid, dni: dni, action: "clear", version: version,
+        createdAt: requestedAt, phase: "debounce", debounceUntil: requestedAt + 1000L]
     state.pending = pending
-    runIn(1, "flushZone", [data: [zoneId: zid], overwrite: true])
+    scheduleZoneFlush(zid, version, 1)
 }
 
 private void flushZone(Map d) {
     Map p = (state.pending ?: [:])[d.zoneId.toString()]
     if (!p) return
+    if (d.version != null && p.version?.toString() != d.version.toString()) {
+        logMessage("debug", "Ignoring obsolete scheduled zone command for zone " + d.zoneId +
+            "; scheduled version=" + d.version + ", current version=" + p.version + ".")
+        return
+    }
+    if (p.phase != "debounce") return
+    Long debounceUntil = p.debounceUntil as Long
+    if (debounceUntil && debounceUntil > now()) {
+        Integer remaining = Math.max(1, Math.ceil((debounceUntil - now()) / 1000.0d) as Integer)
+        scheduleZoneFlush(d.zoneId.toString(), p.version as Integer, remaining)
+        return
+    }
     logMessage("debug", "Debounce elapsed; preparing zone command. zoneId=" + d.zoneId +
         ", action=" + p.action + ", value=" + (p.value ?: "n/a") + ", policy=" + (p.policy ?: "n/a") +
         ", version=" + p.version + ". Fetching fresh system and zone state before write.")
     def c = getChildDevice(p.dni)
     String locationId = c?.getDataValue("locationId")
-    if (!locationId) { logMessage("error", "No location ID for zone " + d.zoneId); return }
-    getLocation(locationId, "zonePreflight", [zoneId: d.zoneId.toString()])
+    if (!locationId) {
+        failPendingZonePreflight([zoneId: d.zoneId.toString(), version: p.version], "zone has no location ID")
+        return
+    }
+    Map current = beginPendingZoneStage(d.zoneId.toString(), p.version, "locationPreflight")
+    if (!current) return
+    try {
+        getLocation(locationId, "zonePreflight", [zoneId: d.zoneId.toString(), version: current.version])
+    } catch (Exception e) {
+        failPendingZonePreflight([zoneId: d.zoneId.toString(), version: current.version],
+            "location request could not be queued: " + e.message)
+    }
 }
 
 private void writeWindowOpen(String zid, Map pending, Map fresh) {
     if (state.windowContactOpen[zid] != true) {
-        state.pending.remove(zid)
+        clearPendingZoneRequest(zid, pending.version)
         logMessage("debug", "Cancelled window-open write for zone " + zid + " because all selected contacts are now closed.")
         return
     }
@@ -1051,18 +1242,18 @@ private void writeWindowOpen(String zid, Map pending, Map fresh) {
     String label = getChildDevice(pending.dni)?.displayName ?: ("zone " + zid)
     logMessage("info", "A selected window contact is open for " + label + ". Setting the zone to a permanent 5 °C override.")
     logMessage("debug", "Window-open override sent; zoneId=" + zid + ", setpoint=5.0 C, permanent=true.")
-    state.pending.remove(zid)
+    clearPendingZoneRequest(zid, pending.version)
 }
 
 private void writeWindowRestore(String zid, Map pending) {
     if (state.windowContactOpen[zid] == true) {
-        state.pending.remove(zid)
+        clearPendingZoneRequest(zid, pending.version)
         logMessage("debug", "Cancelled window restore for zone " + zid + " because a selected contact is open again.")
         return
     }
     Map snapshot = (state.windowSnapshots ?: [:])[zid]
     if (!snapshot) {
-        state.pending.remove(zid)
+        clearPendingZoneRequest(zid, pending.version)
         logMessage("debug", "No saved pre-window state exists for zone " + zid + "; no restore command is needed.")
         return
     }
@@ -1113,22 +1304,26 @@ private void writeWindowRestore(String zid, Map pending) {
             [kind: "zone", id: zid, version: pending.version, windowAction: "restore"])
         logMessage("info", "All selected window contacts are closed. Clearing the override for " + zoneLabel + " and returning it to its schedule.")
     }
-    state.pending.remove(zid)
+    clearPendingZoneRequest(zid, pending.version)
 }
 
 private void writePendingZone(Map meta, Map fresh) {
     String zid = meta.zoneId.toString()
     Map p = (state.pending ?: [:])[zid]
     if (!p) return
+    if (meta.version == null || p.version?.toString() != meta.version.toString()) {
+        logMessage("debug", "Ignoring stale zone preflight response for zone " + zid + "; response version=" +
+            (meta.version ?: "unknown") + ", current version=" + p.version + ".")
+        return
+    }
+    if (p.phase != "zonePreflight") {
+        logMessage("debug", "Ignoring zone preflight response for zone " + zid +
+            " because the pending request is in phase " + (p.phase ?: "unknown") + ".")
+        return
+    }
     logMessage("debug", "Fresh zone state received before write; zoneId=" + zid +
         ", currentSetpointMode=" + ((fresh.heatSetpointStatus ?: fresh.setpointStatus ?: [:]).setpointMode ?: "unknown") +
         ", pendingAction=" + p.action + ", pendingValue=" + (p.value ?: "n/a") + ".")
-    if (meta.version != p.version) {
-        logMessage("debug", "Zone preflight is stale; zoneId=" + zid + ", responseVersion=" + meta.version +
-            ", currentVersion=" + p.version + ". Re-fetching latest requested value.")
-        runIn(1, "flushZone", [data: [zoneId: zid], overwrite: true])
-        return
-    }
     if (p.action == "windowOpen") {
         writeWindowOpen(zid, p, fresh)
         return
@@ -1143,7 +1338,7 @@ private void writePendingZone(Map meta, Map fresh) {
         logMessage("debug", "Sending FollowSchedule clear for zone " + zid + ".")
         apiPut("/WebAPI/emea/api/v1/temperatureZone/" + zid + "/heatSetpoint",
             [HeatSetpointValue: 0.0, SetpointMode: 0, TimeUntil: null], "zoneClear", [kind: "zone", id: zid])
-        state.pending.remove(zid)
+        clearPendingZoneRequest(zid, p.version)
         return
     }
     Map sp = fresh.heatSetpointStatus ?: fresh.setpointStatus ?: [:]
@@ -1173,7 +1368,7 @@ private void writePendingZone(Map meta, Map fresh) {
         if (!until && mode == 2) {
             logMessage("warn", "No next scheduled change is known for " + (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
                 ". The temporary setpoint request was cancelled.")
-            state.pending.remove(zid)
+            clearPendingZoneRequest(zid, p.version)
             getChildDevice(p.dni)?.refresh()
             return
         }
@@ -1184,7 +1379,7 @@ private void writePendingZone(Map meta, Map fresh) {
             logMessage("warn", "The temporary override expiry for " +
                 (getChildDevice(zdni(zid))?.displayName ?: ("zone " + zid)) +
                 " is missing, invalid, or already past. The request was cancelled instead of sending an unusable expiry.")
-            state.pending.remove(zid)
+            clearPendingZoneRequest(zid, p.version)
             getChildDevice(p.dni)?.refresh()
             return
         }
@@ -1195,7 +1390,7 @@ private void writePendingZone(Map meta, Map fresh) {
     logMessage("info", "The target temperature for " + zoneLabel + " is being set to " + p.value +
         " °C in Evohome with a " + (mode == 1 ? "permanent" : "temporary") + " override.")
     logMessage("debug", "Zone write queued; zoneId=" + zid + ", setpoint=" + p.value + " C, mode=" + mode + ", until=" + (until ?: "permanent") + ".")
-    state.pending.remove(zid)
+    clearPendingZoneRequest(zid, p.version)
 }
 
 void setSystemMode(String sid, String mode, def until = null, Boolean restoreZoneOverrides = false) {
